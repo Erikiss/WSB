@@ -57,12 +57,16 @@ class LineParser:
         return False
 
     def number(self):
+        col = self.token.col
         sign = -1 if self.eat("-") else 1
         token = self.token
         if token.kind == "INT":
             return sign * int(self.take("INT").text)
         if token.kind == "FLOAT":
-            return sign * float(self.take("FLOAT").text)
+            value = sign * float(self.take("FLOAT").text)
+            if not math.isfinite(value):
+                raise Problem("E_BAD_ARG", col, "number exceeds the supported floating-point range")
+            return value
         raise Problem("E_SYNTAX", token.col, "expected an integer or floating-point number")
 
     def layer_start(self):

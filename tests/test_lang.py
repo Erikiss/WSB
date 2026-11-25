@@ -160,3 +160,10 @@ s, e = parse('model neox-tiny\\ngauge rotate(resid, orth)')
 assert not e and not validate(s) and hints(s)
 assert 'torch' not in sys.modules
 """], check=True)
+
+
+def test_unrepresentable_float_has_a_json_safe_diagnostic():
+    src = "approx(-1e999) fold_ln()"
+    st, errors = parse("model neox-tiny\n" + src)
+    assert not st
+    assert [(e["code"], e["col"]) for e in errors] == [("E_BAD_ARG", src.index("-") + 1)]
