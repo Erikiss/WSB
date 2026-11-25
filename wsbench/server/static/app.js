@@ -109,7 +109,8 @@ function showHealth(health) {
   for (const [key, value, available] of [
     ['pythia-14m', health.models_local['pythia-14m'] ? 'yes' : 'no', health.models_local['pythia-14m']],
     ['ARC data', health.arc_local ? 'yes' : 'no', health.arc_local],
-    ['LLM', health.llm, health.llm !== 'no-key']
+    ['LLM', health.llm, health.llm !== 'no-key'],
+    ['Claude direct', health.anthropic ? 'yes' : 'no', health.anthropic]
   ]) {
     const item = el('span', 'health-item');
     item.append(el('i', 'dot' + (available ? ' on' : '')), el('b','',key), document.createTextNode(value));
@@ -693,7 +694,7 @@ function renderAssist(data, output, note) {
   for (const role of Object.keys(roleDefaults)) {
     const detail = el('details','details-block');
     const reply=data.roles[role];
-    detail.append(el('summary','',role+' · '+(reply?.model||'Skipped')),el('pre','raw',reply?.text || reply?.error || 'No reply.'));
+    detail.append(el('summary','',role+' · '+(reply?.model||'Skipped')+(reply?.provider ? ' · via '+reply.provider : '')),el('pre','raw',reply?.text || reply?.error || 'No reply.'));
     if (reply && !reply.ok && reply.text && reply.error) detail.append(notice(reply.error));
     if (role === 'translate' && !data.run_id) detail.open = true;   // nothing was measured: show why
     body.append(detail);

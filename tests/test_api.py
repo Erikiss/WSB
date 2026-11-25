@@ -22,6 +22,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("WSB_GOLF_DIR", str(FIXTURES))
     monkeypatch.setenv("WSB_LLM", "mock")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -66,7 +67,7 @@ def test_health(client):
     response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json() == {"version": "0.1.0", "ok": True, "llm": "mock",
-                               "arc_local": True, "models_local": {"pythia-14m": False}}
+                               "arc_local": True, "models_local": {"pythia-14m": False}, "anthropic": False}
 
 
 def test_page_language_examples_palette(client):
@@ -527,3 +528,59 @@ def test_explore_rejects_bad_requests(client):
         assert_error(client.post("/api/explore/start", json=body), 400, "E_BAD_REQUEST")
     assert_error(client.get("/api/explore/" + "0" * 32), 404, "E_NOT_FOUND")
     assert_error(client.post("/api/explore/" + "0" * 32 + "/cancel"), 404, "E_NOT_FOUND")
+
+
+class _FakeAnthropic:
+    """Stands in for anthropic.Anthropic(): records the request and returns a canned Message-like object."""
+
+    def __init__(self, stop_reason="end_turn", model="claude-fable-5-2", text="hello"):
+        from types import SimpleNamespace as NS
+        self.calls = []
+        self._reply = NS(model=model, stop_reason=stop_reason, stop_details=NS(category="cyber"),
+                         content=[NS(type="thinking", thinking=""), NS(type="text", text=text)],
+                         usage=NS(input_tokens=1000, output_tokens=500, cache_read_input_tokens=0,
+                                  cache_creation_input_tokens=0))
+        self.beta = NS(messages=NS(create=self._create))
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._reply
+
+
+def test_claude_models_use_the_anthropic_api_when_its_key_is_set(client, monkeypatch):
+    from wsbench.assist import anthropic_api, openrouter
+
+    monkeypatch.delenv("WSB_LLM")
+    assert client.get("/api/health").json()["anthropic"] is False
+    assert openrouter.chat("translate", "anthropic/claude-fable-5.2", "s", [])["error"] == "no-key"
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    fake = _FakeAnthropic()
+    monkeypatch.setattr(anthropic_api, "_client", fake)
+    health = client.get("/api/health").json()
+    assert health["anthropic"] is True and health["llm"] == "live"
+
+    reply = openrouter.chat("planner", "anthropic/claude-fable-5.2", "system text", [{"role": "user", "content": "hi"}])
+    assert reply["ok"] and reply["text"] == "hello" and reply["provider"] == "anthropic"
+    assert reply["cost_usd"] == pytest.approx((1000 * 8 + 500 * 40) / 1e6)
+    sent = fake.calls[0]
+    assert sent["model"] == "claude-fable-5-2" and sent["system"] == "system text"
+    assert sent["output_config"] == {"effort": "low"} and "thinking" not in sent and "temperature" not in sent
+    assert sent["fallbacks"] == "default" and sent["betas"] == ["server-side-fallback-2026-07-01"]
+
+    # other vendors still go to OpenRouter, which has no key here
+    assert openrouter.chat("critic", "openai/gpt-6.2-sol", "s", [])["error"] == "no-key"
+
+
+def test_anthropic_refusals_and_fallback_models_are_reported(monkeypatch):
+    from wsbench.assist import anthropic_api
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(anthropic_api, "_client", _FakeAnthropic(stop_reason="refusal"))
+    reply = anthropic_api.chat("planner", "anthropic/claude-fable-5.2", "s", [{"role": "user", "content": "x"}])
+    assert not reply["ok"] and reply["error"] == "refusal (cyber)"
+
+    monkeypatch.setattr(anthropic_api, "_client", _FakeAnthropic(model="claude-opus-4-8"))
+    reply = anthropic_api.chat("planner", "anthropic/claude-fable-5.2", "s", [{"role": "user", "content": "x"}])
+    assert reply["ok"] and reply["served_by"] == "claude-opus-4-8"
+    assert reply["cost_usd"] == pytest.approx((1000 * 5 + 500 * 25) / 1e6)      # billed at the fallback model's rate

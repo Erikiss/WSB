@@ -58,7 +58,10 @@ async def http_error(request, exc):
 @app.get("/api/health")
 def health():
     llm = "mock" if os.getenv("WSB_LLM") == "mock" else "live" if os.getenv("OPENROUTER_API_KEY") else "no-key"
-    return {"ok": True, "version": __version__, "llm": llm,
+    from wsbench.assist import anthropic_api
+    if llm == "no-key" and anthropic_api.available():
+        llm = "live"
+    return {"ok": True, "version": __version__, "llm": llm, "anthropic": anthropic_api.available(),
             "models_local": {"pythia-14m": pythia_local()}, "arc_local": arc_local()}
 
 
