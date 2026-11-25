@@ -670,7 +670,7 @@ def test_platform_agent_runs_wsbench_tools_and_keeps_a_transcript(client, tmp_pa
     # setup happened once, with a budget in cents and only WSBench's custom tools
     assert platform.created["env"] == 1 and platform.created["agent"] == 1
     assert platform.created["session"][0]["budget"]["max_list_cost"] == {"amount": "150", "currency": "USD"}
-    assert {t["name"] for t in platform.agent_spec["tools"]} == {"wsl_check", "wsl_run", "arc_tasks", "arc_task", "arxiv_paper"}
+    assert {t["name"] for t in platform.agent_spec["tools"]} == {"wsl_check", "wsl_run", "arc_tasks", "arc_task", "arxiv_paper", "lesswrong_post", "github_repo"}
     assert platform.agent_spec["model"]["id"] == "claude-fable-5-2"
     results = [e for e in platform.sent if e["type"] == "user.custom_tool_result"]
     assert [e["custom_tool_use_id"] for e in results] == ["sevt_2", "sevt_4"]
@@ -729,3 +729,55 @@ def test_arxiv_tool_reads_only_arxiv_and_pages_the_text(tmp_path, monkeypatch):
         arxiv.read("2611.30835", 3, get)
     for bad in ("https://example.com/paper.pdf", "../../etc/passwd", ""):
         assert "not an arXiv identifier" in tools.execute("arxiv_paper", {"paper": bad}, None)
+
+
+def test_lesswrong_tool_reads_posts_by_id(tmp_path, monkeypatch):
+    from wsbench.agent import lesswrong, tools
+
+    monkeypatch.setenv("WSB_HOME", str(tmp_path))
+    asked = []
+
+    def fetch(post_id):
+        asked.append(post_id)
+        return {"data": {"post": {"result": {"title": "A Post", "postedAt": "2026-10-17T16:35:07Z", "baseScore": 42,
+                                             "user": {"displayName": "someone"},
+                                             "htmlBody": "<h2>Claim</h2><p>Layers <b>commute</b>.</p><script>x()</script>"}}}}
+
+    post_id = "3375SZNGA5dKHQMie"
+    overview = lesswrong.read(f"https://www.alignmentforum.org/posts/{post_id}/a-post?x=1", 0, fetch)
+    assert (overview["title"], overview["author"], overview["posted"], overview["karma"]) == ("A Post", "someone", "2026-10-17", 42)
+    assert overview["headings"] == ["Claim"] and overview["text_parts"] == 1
+    assert lesswrong.read(post_id, 1, fetch)["text"] == "Claim\nLayers commute."
+    assert asked == [post_id]                                           # cached after the first read
+    for bad in ("https://example.com/posts/3375SZNGA5dKHQMie/x", "short", "../../etc"):
+        assert "not a LessWrong post" in tools.execute("lesswrong_post", {"post": bad}, None)
+
+
+def test_github_tool_reads_and_searches_a_repository_without_running_it(tmp_path, monkeypatch):
+    import subprocess
+    from wsbench.agent import github, tools
+
+    monkeypatch.setenv("WSB_HOME", str(tmp_path / "home"))
+    source = tmp_path / "remote" / "owner" / "demo"
+    (source / "pkg").mkdir(parents=True)
+    (source / "README.md").write_text("# Demo\nA predictive coding toy.\n")
+    (source / "pkg" / "core.py").write_text("def step(x):\n    return x + 1  # Hebbian update\n")
+    (source / "pkg" / "blob.bin").write_bytes(b"\0\1\2")
+    git = ["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+    base = str(tmp_path / "remote") + "/"
+
+    overview = github.read("https://github.com/owner/demo", base=base)
+    assert overview["entries"] == ["README.md", "pkg/ (2 files)"] and overview["readme"].startswith("# Demo")
+    assert overview["file_types"][".py"] == 1 and overview["files_below"] == 3
+    assert github.read("owner/demo", "pkg", base=base)["entries"] == ["blob.bin", "core.py"]
+    assert "Hebbian update" in github.read("owner/demo", "pkg/core.py", base=base)["text"]
+    assert github.read("owner/demo", search="hebbian", base=base)["matches"] == ["pkg/core.py:2: return x + 1  # Hebbian update"]
+    for path, message in (("pkg/blob.bin", "binary file"), ("../../home", "leaves the repository"), (".git/config", "not readable"),
+                          ("missing.py", "no such path")):
+        with pytest.raises(ValueError, match=message):
+            github.read("owner/demo", path, base=base)
+    for bad in ("../x", "https://evil.example/a/b", "a/b; rm -rf /", "owner"):
+        assert "not a GitHub repository" in tools.execute("github_repo", {"repo": bad}, None)
