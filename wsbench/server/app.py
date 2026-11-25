@@ -13,6 +13,7 @@ from wsbench import __version__
 from wsbench.arc.data import ArcError, arc_local, compiled_preview, list_tasks, task_detail
 from wsbench.arc.render import tensor_view
 from wsbench.assist.pipeline import AssistRequestError, assist
+from wsbench.assist.tasks import tasks as assist_tasks
 from wsbench.exec.jobs import JobError, jobs
 from wsbench.lang.card import LANGUAGE_CARD
 from wsbench.lang.hints import hints
@@ -124,7 +125,29 @@ def arc_compiled(task: str, prim: str, size: str = "fixed", source: str = Query(
 
 @app.post("/api/assist")
 def assist_request(payload: dict):
-    return assist(payload, lambda script, predictions=None: jobs.submit(script, predictions, source="assist"))
+    return assist(payload, _assist_submit)
+
+
+def _assist_submit(script, predictions=None):
+    return jobs.submit(script, predictions, source="assist")
+
+
+@app.post("/api/assist/start")
+def assist_start(payload: dict):
+    return {"assist_id": assist_tasks.start(payload, _assist_submit)}
+
+
+@app.get("/api/assist/latest")
+def assist_latest():
+    return {"assist": assist_tasks.latest()}
+
+
+@app.get("/api/assist/{assist_id}")
+def assist_status(assist_id: str):
+    record = assist_tasks.get(assist_id)
+    if record is None:
+        return error(404, "E_NOT_FOUND", "unknown assist request")
+    return record
 
 
 @app.get("/")

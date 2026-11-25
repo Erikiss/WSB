@@ -119,7 +119,7 @@ def assist(request: dict, submit) -> dict:
         record("translate", errors)
         break
     if not statements:
-        record("translate", [_syntax("no valid translator statements")])
+        record("translate", [_syntax("no testable statement: the translator found no claim that the available operations can check")])
         return result
 
     proposed = [print_statement(stmt, with_label=False) for stmt in statements[:8]]

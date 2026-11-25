@@ -37,8 +37,10 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 
 - Every script run is stored as a JSON file in `WSB_HOME/history/` (the 50 newest are kept): script, verdicts, status and source (`editor`, `arc` or `assist`). A running script is saved at most every two seconds and when it ends.
 - `GET /api/runs` lists the 20 newest runs. `GET /api/runs/{run_id}` also answers for runs of an earlier server process, and adds `script`, `source` and `created` to the response.
-- After a page reload the Editor shows its most recent run again, including one that is still running, and the Assist tab shows its most recent measured script. The model replies of an assist run are not stored.
+- After a page reload the Editor shows its most recent run again, including one that is still running, and the Assist tab shows its most recent measured script.
 - A run that was in progress when the server stopped is shown as `cancelled`; its unfinished statements get `E_RUNTIME` with the message `interrupted: the server restarted before this statement finished`.
+- The Assist tab starts a request with `POST /api/assist/start` and reads its state from `GET /api/assist/{assist_id}` once a second, so no HTTP request stays open while the models answer. Each request is stored in `WSB_HOME/assist_history/` with the model replies (the 20 newest are kept), and `GET /api/assist/latest` returns the newest one, which the tab shows again after a reload. `POST /api/assist` still answers synchronously.
+- When the translator finds no testable claim, the Assist tab opens the translator's reply and reports `no testable statement`.
 - Tensor views need the edited weights, which are kept in memory only. For a run of an earlier server process they answer 410 `E_EXPIRED`.
 
 ## Acceptance measurements
