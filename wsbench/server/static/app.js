@@ -94,7 +94,7 @@ const initialScript = [
 
 function navigate() {
   const id = location.hash.slice(1);
-  activeTab = ['editor','arc','assist','explore','language'].includes(id) ? id : 'editor';
+  activeTab = ['editor','arc','assist','explore','agent','language'].includes(id) ? id : 'editor';
   document.querySelectorAll('.tab-page').forEach(page => { page.hidden = page.id !== activeTab; });
   document.querySelectorAll('.tabs a').forEach(link => {
     if (link.hash === '#' + activeTab) link.setAttribute('aria-current', 'page');
@@ -907,6 +907,106 @@ $('explore-cancel').onclick = async () => {
   try { await request('/api/explore/' + exploreView.id + '/cancel', {}); } catch (error) { report(error); }
 };
 $('explore-output').replaceChildren(empty('Describe an idea to start a series of measured rounds.','spark'));
+// ---- Agent: a Claude Managed Agent that uses WSBench as its tools ---------------------------------------------------
+const agentView = {id: null, revision: -1, nodes: [], token: null, status: null};
+function agentItem(item, index) {
+  let node = agentView.nodes[index];
+  if (!node) {
+    node = {root: el('div','assist-detail agent-item agent-' + item.kind), pane: null, table: null, drawn: null};
+    if (item.kind === 'tool') {
+      node.head = el('h4');
+      node.input = el('details','details-block');
+      node.input.append(el('summary','','Input'), el('pre','raw', item.input?.script ?? JSON.stringify(item.input, null, 1)));
+      if (item.input?.script) node.input.append(button('Open in editor',()=>openInEditor(item.input.script)));
+      node.table = el('div');
+      node.result = el('details','details-block');
+      node.root.append(node.head, node.input, node.table, node.result);
+    } else {
+      node.root.append(el('p','meta', {user:'You', agent:'Agent', note:'Note', error:'Error'}[item.kind] || item.kind), el('pre','raw report', item.text));
+    }
+    $('agent-output').append(node.root);
+    agentView.nodes[index] = node;
+  }
+  if (item.kind !== 'tool') return;
+  node.head.textContent = item.name + (item.result == null ? ' · running…' : '');
+  if (item.result != null && !node.result.childElementCount && item.name !== 'wsl_run')
+    node.result.append(el('summary','','Result'), el('pre','raw', item.result));
+  if (item.run_id && node.drawn !== 'final') {
+    if (!node.pane) { node.pane = newPane('agent-' + index, node.table, el('span')); node.pane.id = item.run_id; }
+    request('/api/runs/' + item.run_id).then(run => {
+      drawVerdicts(node.pane, run.verdicts);
+      if (['done','cancelled'].includes(run.status)) node.drawn = 'final';
+    }).catch(() => {});
+  }
+}
+function drawAgent(record) {
+  const live = record.status === 'running';
+  agentView.status = record.status;
+  $('agent-send').disabled = live || (agentView.id && record.status !== 'idle');
+  $('agent-stop').hidden = !live;
+  record.items.forEach(agentItem);
+  if (record.revision === agentView.revision) return;
+  agentView.revision = record.revision;
+  $('agent-status').textContent = record.status + (record.cost_usd != null ? ' · $' + Number(record.cost_usd).toFixed(2) + ' of $' + Number(record.budget_usd).toFixed(2) : '');
+  $('agent-output').querySelectorAll('.agent-extra').forEach(node => node.remove());
+  const extra = el('div','assist-detail agent-extra');
+  if (record.status === 'error' && record.error) extra.append(notice(record.error));
+  if (['budget','terminated','closed','error'].includes(record.status)) extra.append(el('p','meta','This conversation cannot be continued. Start a new one.'));
+  if (record.console_url) { const link = el('a','', 'Open the session in the Claude Console'); link.href = record.console_url; link.target = '_blank'; link.rel = 'noopener'; extra.append(link); }
+  if (extra.childElementCount) $('agent-output').append(extra);
+}
+async function followAgent(id) {
+  const token = agentView.token = {};
+  agentView.nodes.forEach((_, index) => clearPane('agent-' + index));
+  Object.assign(agentView, {id, revision: -1, nodes: []});
+  $('agent-output').replaceChildren();
+  let failures = 0;
+  for (;;) {
+    let record;
+    try { record = await request('/api/agent/' + encodeURIComponent(id)); failures = 0; }
+    catch (error) {
+      if (agentView.token !== token) return;
+      if (++failures > 30 || /E_NOT_FOUND/.test(error.message)) { $('agent-output').append(notice(error.message)); $('agent-status').textContent = 'Error'; return; }
+      $('agent-status').textContent = 'Connection lost, retrying…';
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      continue;
+    }
+    if (agentView.token !== token) return;
+    drawAgent(record);
+    await new Promise(resolve => setTimeout(resolve, record.status === 'running' ? 1000 : 4000));
+    if (record.status !== 'running' && record.status !== 'idle') return;
+  }
+}
+async function sendAgent(event) {
+  event.preventDefault();
+  const text = $('agent-text').value.trim();
+  if (!text) return;
+  $('agent-send').disabled = true;
+  try {
+    if (agentView.id && agentView.status === 'idle') await request('/api/agent/' + agentView.id + '/message', {text});
+    else {
+      const {agent_conv_id} = await request('/api/agent/start', {text, budget_usd: Number($('agent-budget').value)});
+      followAgent(agent_conv_id);
+    }
+    $('agent-text').value = '';
+  } catch (error) { report(error); $('agent-send').disabled = false; }
+}
+async function resumeAgent() {
+  let latest;
+  try { latest = (await request('/api/agent/latest')).agent; } catch { return; }
+  if (latest && !agentView.token) followAgent(latest.agent_conv_id);
+}
+$('agent-form').onsubmit = sendAgent;
+$('agent-new').onclick = () => {
+  agentView.token = {}; agentView.id = null; agentView.status = null; agentView.nodes = [];
+  $('agent-output').replaceChildren(empty('Describe an idea to start a conversation with the agent.','spark'));
+  $('agent-status').textContent = ''; $('agent-send').disabled = false; $('agent-stop').hidden = true;
+};
+$('agent-stop').onclick = async () => {
+  if (!agentView.id) return;
+  try { await request('/api/agent/' + agentView.id + '/interrupt', {}); } catch (error) { report(error); }
+};
+$('agent-output').replaceChildren(empty('Describe an idea to start a conversation with the agent.','spark'));
 async function restoreRuns() {
   let runs;
   try { runs = await request('/api/runs'); } catch { return; }
@@ -916,5 +1016,6 @@ async function restoreRuns() {
 restoreRuns();
 resumeAssist();
 resumeExplore();
-request('/api/health').then(showHealth).catch(error=>{$('health').textContent=error.message;});
+resumeAgent();
+request('/api/health').then(health => { showHealth(health); $('agent-nokey').hidden = Boolean(health.agent); }).catch(error=>{$('health').textContent=error.message;});
 request('/api/language').then(setupLanguage).catch(report);

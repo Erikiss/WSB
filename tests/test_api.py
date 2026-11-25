@@ -4,6 +4,8 @@ from threading import Event
 from time import monotonic, sleep
 from uuid import UUID
 
+from json import loads as json_loads
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -67,7 +69,7 @@ def test_health(client):
     response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json() == {"version": "0.1.0", "ok": True, "llm": "mock",
-                               "arc_local": True, "models_local": {"pythia-14m": False}, "anthropic": False}
+                               "arc_local": True, "models_local": {"pythia-14m": False}, "anthropic": False, "agent": True}
 
 
 def test_page_language_examples_palette(client):
@@ -584,3 +586,120 @@ def test_anthropic_refusals_and_fallback_models_are_reported(monkeypatch):
     reply = anthropic_api.chat("planner", "anthropic/claude-fable-5.2", "s", [{"role": "user", "content": "x"}])
     assert reply["ok"] and reply["served_by"] == "claude-opus-4-8"
     assert reply["cost_usd"] == pytest.approx((1000 * 5 + 500 * 25) / 1e6)      # billed at the fallback model's rate
+
+
+class _FakePlatform:
+    """Stands in for the Managed Agents API: scripted events per turn, records what the client sends."""
+
+    def __init__(self, turns):
+        from types import SimpleNamespace as NS
+        self.NS, self.turns, self.sent, self.created = NS, list(turns), [], {"env": 0, "agent": 0, "update": 0, "session": []}
+        self._turn = -1
+        outer = self
+
+        class Stream:
+            def __init__(self, events): self.events = events
+            def __enter__(self): return iter(self.events)
+            def __exit__(self, *a): return False
+
+        def stream(session_id):                     # opened before the message is sent
+            return Stream(list(outer.turns[outer._turn + 1]))
+
+        def send(session_id, events):
+            outer.sent.extend(events)
+            if events[0]["type"] == "user.message":
+                outer._turn += 1
+
+        def env_create(**kw): outer.created["env"] += 1; return NS(id="env_1")
+        def agent_create(**kw): outer.created["agent"] += 1; outer.agent_spec = kw; return NS(id="agent_1", version=1)
+        def agent_update(agent_id, **kw): outer.created["update"] += 1; return NS(id=agent_id, version=2)
+        def session_create(**kw): outer.created["session"].append(kw); return NS(id="sesn_1")
+        def session_retrieve(session_id): return NS(usage=NS(list_cost=NS(amount="37", currency="USD")))
+
+        self.beta = NS(environments=NS(create=env_create), agents=NS(create=agent_create, update=agent_update),
+                       sessions=NS(create=session_create, retrieve=session_retrieve,
+                                   events=NS(stream=stream, send=send, list=lambda session_id: NS(data=[]))))
+
+
+def _ev(kind, n, **fields):
+    from types import SimpleNamespace as NS
+    return NS(type=kind, id=f"sevt_{n}", **fields)
+
+
+def _wait_agent(client, conv_id):
+    deadline = monotonic() + 30
+    while True:
+        record = client.get(f"/api/agent/{conv_id}").json()
+        if record["status"] != "running":
+            return record
+        assert monotonic() < deadline
+        sleep(0.05)
+
+
+def test_platform_agent_runs_wsbench_tools_and_keeps_a_transcript(client, tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from wsbench.agent import sessions as module
+
+    monkeypatch.delenv("WSB_LLM")
+    assert_error(client.post("/api/agent/start", json={"text": "idea"}), 400, "E_NO_KEY")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    script = "model neox-tiny\nP1: gauge permute(L[1].mlp, randperm)\nP2: gauge rotate(L[1].mlp, orth)\n"
+    idle = NS(type="end_turn")
+    platform = _FakePlatform([
+        [_ev("agent.message", 1, content=[NS(type="text", text="Ich teste Permutation gegen Rotation.")]),
+         _ev("agent.custom_tool_use", 2, name="wsl_check", input={"script": script}),
+         _ev("session.status_idle", 3, stop_reason=NS(type="requires_action")),
+         _ev("agent.custom_tool_use", 4, name="wsl_run", input={"script": script}),
+         _ev("agent.message", 5, content=[NS(type="text", text="Permutation ist exakt, Rotation nicht.")]),
+         _ev("session.status_idle", 6, stop_reason=idle)],
+        [_ev("agent.message", 7, content=[NS(type="text", text="Gern.")]),
+         _ev("session.status_idle", 8, stop_reason=idle)],
+    ])
+    monkeypatch.setattr(module.sessions, "_client", platform)
+
+    conv_id = client.post("/api/agent/start", json={"text": "Sind Neuronen vertauschbar?", "budget_usd": 1.5}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle" and record["cost_usd"] == 0.37 and record["session_id"] == "sesn_1"
+    assert [item["kind"] for item in record["items"]] == ["user", "agent", "tool", "tool", "agent"]
+    check, run = record["items"][2], record["items"][3]
+    assert json_loads(check["result"])["errors"] == []
+    verdicts = json_loads(run["result"])["verdicts"]
+    assert [v["status"] for v in verdicts] == ["CONFIRMED", "REFUTED"]
+    assert client.get(f"/api/runs/{run['run_id']}").json()["source"] == "agent"
+
+    # setup happened once, with a budget in cents and only WSBench's custom tools
+    assert platform.created["env"] == 1 and platform.created["agent"] == 1
+    assert platform.created["session"][0]["budget"]["max_list_cost"] == {"amount": "150", "currency": "USD"}
+    assert {t["name"] for t in platform.agent_spec["tools"]} == {"wsl_check", "wsl_run", "arc_tasks", "arc_task"}
+    assert platform.agent_spec["model"]["id"] == "claude-fable-5-2"
+    results = [e for e in platform.sent if e["type"] == "user.custom_tool_result"]
+    assert [e["custom_tool_use_id"] for e in results] == ["sevt_2", "sevt_4"]
+
+    # a second message continues the same session; the agent is not created again
+    assert client.post(f"/api/agent/{conv_id}/message", json={"text": "Danke"}).json() == {"ok": True}
+    record = _wait_agent(client, conv_id)
+    assert record["items"][-1] == {"kind": "agent", "text": "Gern."} and len(platform.created["session"]) == 1
+    assert platform.created["agent"] == 1 and (tmp_path / "agent.json").exists()
+    assert client.get("/api/agent/latest").json()["agent"]["agent_conv_id"] == conv_id
+    assert module.AgentSessions().get(conv_id)["status"] == "closed"        # stored; a new process cannot continue it
+
+
+def test_platform_agent_reports_budget_and_errors(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    from wsbench.agent import sessions as module
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    platform = _FakePlatform([[_ev("session.status_idle", 1, stop_reason=NS(type="budget_reached"))]])
+    monkeypatch.setattr(module.sessions, "_client", platform)
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "budget" and record["items"][-1]["kind"] == "note"
+    assert_error(client.post(f"/api/agent/{conv_id}/message", json={"text": "more"}), 400, "E_BAD_REQUEST")
+    assert_error(client.post("/api/agent/start", json={"text": "idea", "budget_usd": 500}), 400, "E_BAD_REQUEST")
+    assert_error(client.get("/api/agent/" + "0" * 32), 404, "E_NOT_FOUND")
+
+    def boom(**kw): raise RuntimeError("platform down")
+    platform.beta.sessions.create = boom
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "error" and "platform down" in record["error"]

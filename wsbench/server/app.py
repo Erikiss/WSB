@@ -13,6 +13,8 @@ from wsbench import __version__
 from wsbench.arc.data import ArcError, arc_local, compiled_preview, list_tasks, task_detail
 from wsbench.arc.render import tensor_view
 from wsbench.assist.pipeline import AssistRequestError, assist
+from wsbench.agent.sessions import AgentError, sessions as agent_sessions
+from wsbench.agent.sessions import available as agent_sessions_available
 from wsbench.assist.explore_tasks import tasks as explore_tasks
 from wsbench.assist.tasks import tasks as assist_tasks
 from wsbench.exec.jobs import JobError, jobs
@@ -38,6 +40,7 @@ def error(status, code, message):
     return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
 
 
+@app.exception_handler(AgentError)
 @app.exception_handler(JobError)
 @app.exception_handler(ArcError)
 @app.exception_handler(AssistRequestError)
@@ -62,6 +65,7 @@ def health():
     if llm == "no-key" and anthropic_api.available():
         llm = "live"
     return {"ok": True, "version": __version__, "llm": llm, "anthropic": anthropic_api.available(),
+            "agent": agent_sessions_available(),
             "models_local": {"pythia-14m": pythia_local()}, "arc_local": arc_local()}
 
 
@@ -195,6 +199,43 @@ def explore_cancel(explore_id: str):
     if not explore_tasks.cancel(explore_id):
         return error(404, "E_NOT_FOUND", "unknown explore request")
     return {"ok": True}
+
+
+class AgentStart(BaseModel):
+    text: str
+    budget_usd: float = 2.0
+
+
+class AgentMessage(BaseModel):
+    text: str
+
+
+@app.post("/api/agent/start")
+def agent_start(payload: AgentStart):
+    return {"agent_conv_id": agent_sessions.start(payload.text, payload.budget_usd, jobs)}
+
+
+@app.get("/api/agent/latest")
+def agent_latest():
+    return {"agent": agent_sessions.latest()}
+
+
+@app.get("/api/agent/{conv_id}")
+def agent_status(conv_id: str):
+    record = agent_sessions.get(conv_id)
+    if record is None:
+        return error(404, "E_NOT_FOUND", "unknown conversation")
+    return record
+
+
+@app.post("/api/agent/{conv_id}/message")
+def agent_message(conv_id: str, payload: AgentMessage):
+    return agent_sessions.message(conv_id, payload.text, jobs)
+
+
+@app.post("/api/agent/{conv_id}/interrupt")
+def agent_interrupt(conv_id: str):
+    return agent_sessions.interrupt(conv_id)
 
 
 @app.get("/")
