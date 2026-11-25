@@ -687,6 +687,56 @@ function setupRoles() {
     $('role-fields').append(field(role[0].toUpperCase()+role.slice(1),input));
   }
 }
+function renderAssist(data, output, note) {
+  const body = el('div','assist-detail');
+  body.append(el('p','cost',(note ? note + ' · ' : '') + 'Cost · $'+Number(data.cost_usd).toFixed(4)));
+  for (const role of Object.keys(roleDefaults)) {
+    const detail = el('details','details-block');
+    const reply=data.roles[role];
+    detail.append(el('summary','',role+' · '+(reply?.model||'Skipped')),el('pre','raw',reply?.text || reply?.error || 'No reply.'));
+    if (reply && !reply.ok && reply.text && reply.error) detail.append(notice(reply.error));
+    if (role === 'translate' && !data.run_id) detail.open = true;   // nothing was measured: show why
+    body.append(detail);
+  }
+  for (const problem of data.parse_errors) body.append(notice(problem.role+(problem.line!=null?' · line '+problem.line+':'+problem.col:'')+' · '+problem.code+' '+problem.message));
+  body.append(el('h3','','Combined script'),el('pre','raw',data.script),button('Open in editor',()=>openInEditor(data.script)));
+  output.replaceChildren(body);
+}
+// The models take about half a minute. The page starts the request, then asks for its state every second,
+// so a dropped connection or a reload does not lose the answer.
+async function followAssist(id, note) {
+  const status = $('assist-status'), output = $('assist-output');
+  const token = followAssist.token = {};
+  const started = Date.now();
+  let failures = 0;
+  for (;;) {
+    let task;
+    try { task = await request('/api/assist/' + encodeURIComponent(id)); failures = 0; }
+    catch (error) {
+      if (followAssist.token !== token) return;
+      if (++failures > 30 || /E_NOT_FOUND/.test(error.message)) { output.replaceChildren(notice(error.message)); status.textContent = 'Error'; return; }
+      status.textContent = 'Connection lost, retrying…';
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      continue;
+    }
+    if (followAssist.token !== token) return;
+    if (task.status === 'running') {
+      status.textContent = 'Calling models… ' + Math.round((Date.now() - started) / 1000) + ' s';
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
+    }
+    if (task.status === 'error') { output.replaceChildren(notice(task.error.code + ' · ' + task.error.message)); status.textContent = 'Error'; return; }
+    const data = task.result;
+    renderAssist(data, output, note);
+    if (data.run_id) {
+      const results = el('div');
+      output.append(results);
+      try { await poll(newPane('assist',results,status,true),data.run_id); }
+      catch (error) { output.append(notice(error.message)); status.textContent = 'Error'; }
+    } else status.textContent='Complete';
+    return;
+  }
+}
 async function assist(event) {
   event.preventDefault();
   const execute = event.submitter?.id !== 'assist-only';
@@ -697,24 +747,8 @@ async function assist(event) {
   output.replaceChildren();
   $('assist-run').disabled = $('assist-only').disabled = true;
   try {
-    const data = await request('/api/assist', {text:$('abstract').value, model:$('target').value, roles, execute});
-    const body = el('div','assist-detail');
-    body.append(el('p','cost','Cost · $'+Number(data.cost_usd).toFixed(4)));
-    for (const role of Object.keys(roleDefaults)) {
-      const detail = el('details','details-block');
-      const reply=data.roles[role];
-      detail.append(el('summary','',role+' · '+(reply?.model||'Skipped')),el('pre','raw',reply?.text || reply?.error || 'No reply.'));
-      if (reply && !reply.ok && reply.text && reply.error) detail.append(notice(reply.error));
-      body.append(detail);
-    }
-    for (const problem of data.parse_errors) body.append(notice(problem.role+(problem.line!=null?' · line '+problem.line+':'+problem.col:'')+' · '+problem.code+' '+problem.message));
-    body.append(el('h3','','Combined script'),el('pre','raw',data.script),button('Open in editor',()=>openInEditor(data.script)));
-    output.append(body);
-    if (data.run_id) {
-      const results = el('div');
-      output.append(results);
-      await poll(newPane('assist',results,status,true),data.run_id);
-    } else status.textContent='Complete';
+    const {assist_id} = await request('/api/assist/start', {text:$('abstract').value, model:$('target').value, roles, execute});
+    await followAssist(assist_id);
   } catch (error) { output.append(notice(error.message)); status.textContent='Error'; }
   finally { $('assist-run').disabled = $('assist-only').disabled = false; }
 }
@@ -754,24 +788,21 @@ async function resumeEditor(run) {
   catch (error) { if (isCurrent(pane)) { $('editor-status').textContent = 'Error'; pane.table.replaceChildren(notice(error.message)); } }
   finally { if (isCurrent(pane)) { $('run').disabled = false; $('cancel').hidden = true; } }
 }
-async function resumeAssist(run) {
-  const output = $('assist-output'), status = $('assist-status');
-  const body = el('div','assist-detail');
-  body.append(el('p','cost','Restored from ' + new Date(run.created * 1000).toLocaleString() + ' · the model replies are not stored'),
-    el('h3','','Combined script'), el('pre','raw',run.script), button('Open in editor',()=>openInEditor(run.script)));
-  const results = el('div');
-  output.replaceChildren(body, results);
-  try { await poll(newPane('assist',results,status,true), run.run_id); }
-  catch (error) { output.append(notice(error.message)); }
+async function resumeAssist() {
+  let latest;
+  try { latest = (await request('/api/assist/latest')).assist; } catch { return; }
+  if (!latest || panes.assist || followAssist.token) return;
+  if (latest.request?.text && !$('abstract').value) $('abstract').value = latest.request.text;
+  if (latest.request?.model && [...$('target').options].some(o => o.value === latest.request.model)) $('target').value = latest.request.model;
+  await followAssist(latest.assist_id, 'Restored from ' + new Date(latest.created * 1000).toLocaleString());
 }
 async function restoreRuns() {
   let runs;
   try { runs = await request('/api/runs'); } catch { return; }
   const lastEditor = runs.find(run => run.source === 'editor');
-  const lastAssist = runs.find(run => run.source === 'assist');
   if (lastEditor && !panes.editor) resumeEditor(lastEditor);
-  if (lastAssist && !panes.assist) resumeAssist(lastAssist);
 }
 restoreRuns();
+resumeAssist();
 request('/api/health').then(showHealth).catch(error=>{$('health').textContent=error.message;});
 request('/api/language').then(setupLanguage).catch(report);
