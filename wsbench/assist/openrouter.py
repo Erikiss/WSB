@@ -1,11 +1,11 @@
-"""Non-streaming OpenRouter client for the three assist roles."""
+"""Model client for the assist roles: OpenRouter, or the Anthropic API for Claude models when its key is set."""
 
 import math
 import os
 
 import httpx
 
-from . import mock
+from . import anthropic_api, mock
 
 DEFAULT_ROLES = {
     "translate": "anthropic/claude-fable-5.2",
@@ -26,6 +26,9 @@ def chat(role: str, model_id: str, system: str, messages: list[dict]) -> dict:
     if os.getenv("WSB_LLM") == "mock":
         result.update(ok=True, text=mock.reply(role, messages), finish_reason="stop")
         return result
+    if anthropic_api.handles(model_id):        # Claude models go to the Anthropic API when its key is set
+        return anthropic_api.chat(role, model_id, system, messages)
+    result["provider"] = "openrouter"
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
         result["error"] = "no-key"

@@ -52,6 +52,24 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 - Endpoints: `POST /api/explore/start`, `GET /api/explore/{id}`, `GET /api/explore/latest`, `POST /api/explore/{id}/answer`, `POST /api/explore/{id}/cancel`. State is stored in `WSB_HOME/explore_history/` (the 20 newest are kept) and restored after a reload. A loop that was running when the server stopped is reported as interrupted and does not resume.
 - Live check on pythia-14m (two rounds, a German idea about interchangeable middle layers): 22 statements measured in 94 s for $0.35; the planner model accepted the measured results as input both times.
 
+## Model providers
+
+- With `ANTHROPIC_API_KEY` set, every model ID that starts with `anthropic/` is called through the Anthropic API with the official `anthropic` package: the Explore planner and report, and the Assist translator. The ID is mapped to the Anthropic form (`anthropic/claude-fable-5.2` → `claude-fable-5-2`). All other models, and Claude models when the key is missing, go through OpenRouter.
+- The Anthropic call sends `output_config.effort = low`, no `thinking` and no sampling parameters, and opts into the server-side refusal fallback (`fallbacks="default"`, beta `server-side-fallback-2026-07-01`). When a fallback model answered, the reply carries `served_by` and the cost uses that model's price.
+- Costs for Anthropic calls are computed from the token usage and a price table (Fable 5.2: $8 / $40 per 1M tokens); prompt caching is not used, so the estimate is an upper bound.
+- `/api/health` reports `anthropic: true|false`, the header shows it as `Claude direct`, and each reply carries `provider`.
+- Not verified live: this path was tested with a stand-in client only. No Anthropic key was available in the development environment.
+
+## Research agent (Claude Platform)
+
+- The Agent tab talks to a Claude Managed Agent (beta). Anthropic hosts the agent loop; WSBench executes the agent's tool calls locally, so every measurement is the same deterministic executor the Editor uses. This is the high-agency layer: the agent decides what to test, writes WSL itself and converses over several turns. The Explore tab is the fixed loop in between, and the Editor is fully manual.
+- Agent definition (`wsbench/agent/spec.py`): model `claude-fable-5-2` at effort `medium`, a system prompt with the language card, and four custom tools: `wsl_check`, `wsl_run`, `arc_tasks`, `arc_task`. No sandbox tools and no web access.
+- The environment and the agent are created once and their IDs are stored in `WSB_HOME/agent.json`; the agent is updated in place when the definition changes. Each conversation is one session with a hard budget (default $2, at most $20), set as a session budget in cents.
+- A turn opens the event stream before it sends the message, answers `agent.custom_tool_use` events with `user.custom_tool_result`, ends on an idle event whose stop reason is not `requires_action`, and after a dropped stream reads the missed events from the event list. Stop sends `user.interrupt` and cancels a running script.
+- Transcripts are stored in `WSB_HOME/agent_history/` and shown again after a reload. After a server restart a conversation is shown as `closed`: the session still exists on the Claude Platform, but this server cannot continue it.
+- With `WSB_LLM=mock` a scripted stand-in platform answers, for offline use.
+- Not verified live: no Anthropic key was available in the development environment. Tested with stand-in platforms only (event handling, tool execution, budget, errors, storage) and in Chromium in mock mode.
+
 ## Acceptance measurements
 
 - The pinned Pythia download matched all three SHA-256 values. The 76-tensor model yielded 149 probe tokens, loss 4.3176623 and maximum absolute logit 25.84748.

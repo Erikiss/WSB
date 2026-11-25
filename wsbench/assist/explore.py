@@ -111,7 +111,8 @@ def explore(request, submit, snapshot, cancel_run, *, on_update=lambda state: No
         for model_id in planners:
             reply = openrouter.chat(role, model_id, system, [{"role": "user", "content": user}])
             state["cost_usd"] += reply["cost_usd"]
-            state["planner_calls"].append({k: reply[k] for k in ("model", "ok", "error", "cost_usd")} | {"role": role})
+            state["planner_calls"].append({k: reply[k] for k in ("model", "ok", "error", "cost_usd")}
+                                          | {"role": role, "provider": reply.get("provider")})
             if reply["ok"]:
                 return reply
         return reply

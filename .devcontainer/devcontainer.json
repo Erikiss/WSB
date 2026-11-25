@@ -8,6 +8,9 @@
     "8765": { "label": "WSBench", "onAutoForward": "notify" }
   },
   "secrets": {
+    "ANTHROPIC_API_KEY": {
+      "description": "Optional. With it, Claude models (planner, report, translate) are billed to your Anthropic Console credits instead of OpenRouter."
+    },
     "OPENROUTER_API_KEY": {
       "description": "OpenRouter key for the Assist tab. Optional: without it the app runs, and Assist reports no-key."
     }

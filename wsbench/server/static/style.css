@@ -199,3 +199,7 @@ pre.raw, .language-card { white-space: pre-wrap; overflow-wrap: anywhere; font: 
 .explore-round:first-child { border-top: 0; }
 .report { white-space: pre-wrap; }
 #explore-answer { width: 100%; margin: 0 0 .6rem; padding: .5rem .6rem; font: inherit; }
+
+.agent-item { border-top: 1px solid var(--line, #dce1e7); }
+.agent-item:first-child { border-top: 0; }
+.agent-user pre { background: #eef4ff; }

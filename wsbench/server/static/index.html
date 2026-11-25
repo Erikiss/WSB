@@ -24,6 +24,9 @@
       <a href="#assist" data-icon="spark">Assist</a>
 
       <a href="#explore" data-icon="spark">Explore</a>
+
+
+      <a href="#agent" data-icon="spark">Agent</a>
       <a href="#language" data-icon="book">Language</a>
     </nav>
   </header>
@@ -119,6 +122,27 @@
           </div>
         </form>
         <div class="panel"><div class="panel-heading"><h2>Rounds</h2><span class="meta" id="explore-status" aria-live="polite"></span></div><div id="explore-output"></div></div>
+      </div>
+    </section>
+    <section id="agent" class="tab-page" hidden>
+      <div class="page-heading"><h1>Research agent</h1></div>
+      <div class="assist-layout">
+        <form id="agent-form" class="panel">
+          <div class="panel-heading"><h2>Message</h2></div>
+          <div class="form-body">
+            <label class="sr-only" for="agent-text">Your message to the agent</label>
+            <textarea id="agent-text" required rows="6" placeholder="Describe an idea or answer the agent, in any language."></textarea>
+            <label class="field" for="agent-budget">Budget for a new conversation, in USD<input id="agent-budget" type="number" min="0.5" max="20" step="0.5" value="2" required></label>
+            <p class="meta">A Claude agent on the Claude Platform plans and reasons; WSBench measures. The agent is billed to your Anthropic credits and stops when the budget is spent. Sessions are kept on the Claude Platform until you delete them there.</p>
+            <div id="agent-nokey" class="notice" hidden>Set ANTHROPIC_API_KEY on the server to use the agent.</div>
+            <div class="actions">
+              <button type="submit" class="primary" id="agent-send" data-icon="play">Send</button>
+              <button type="button" id="agent-new">New conversation</button>
+              <button type="button" id="agent-stop" hidden>Stop</button>
+            </div>
+          </div>
+        </form>
+        <div class="panel"><div class="panel-heading"><h2>Conversation</h2><span class="meta" id="agent-status" aria-live="polite"></span></div><div id="agent-output"></div></div>
       </div>
     </section>
     <section id="language" class="tab-page" hidden>
