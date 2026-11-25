@@ -19,7 +19,7 @@ wsbench run tests/data/tiny_battery.wsl --json /tmp/tiny-verdicts.json
 pytest -q
 ```
 
-Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `OPENROUTER_API_KEY` from its environment. Run the optional acceptance suites with `pytest -m network`, `pytest -m slow`, and `pytest -m live`.
+Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `OPENROUTER_API_KEY` from its environment. Run the optional acceptance suites with `pytest -m network`, `pytest -m slow`, and `pytest -m live`. To repeat the three live checks on GitHub, manually dispatch the **OpenRouter live tests** workflow with the `OPENROUTER_API_KEY` Actions repository secret configured.
 
 ## Implementation decisions
 
@@ -80,6 +80,6 @@ The four-thread CPU run used the unmodified float32 trainer. The validation proc
 ### Assist and final checks
 
 - The mocked three-role pipeline returned all five expected labels, verdicts and agreement values. Its syntax-repair case made one repair call.
-- All three optional live OpenRouter checks skipped because the environment had no `OPENROUTER_API_KEY`. No live calls or charges occurred.
+- On 2026-11-25, all three default models returned a live completion through OpenRouter in 35.90 seconds. The test reported USD 0.046960 for `anthropic/claude-fable-5.2`, USD 0.000000 for `openai/gpt-6.2-sol` and USD 0.024789 for `google/gemini-4-neon`, totaling USD 0.071749. [GitHub Actions run](https://github.com/Erikiss/WSB/actions/runs/45612629646)
 - The complete offline suite passed 97 tests. The three Appendix A–C kernel files matched the supplied source byte for byte. A wheel installation check loaded the CLI, bundled WSL examples and static application.
 - The Cloud preview on port 3000 uses mock Assist. The verified modular-addition checkpoints are available in this Cloud computer's default cache; the source archive can regenerate them by running the D.3 example.
