@@ -56,3 +56,10 @@ The four-thread CPU run used the unmodified float32 trainer. The validation proc
 - The HTTP cancellation check observed a running train statement through two evaluations, stopped it within two seconds, and verified that it wrote no run.
 - Each run stores effective training arguments in `run.json` and publishes its completed checkpoint set by directory rename.
 - The complete D.3 script passed all numerical acceptance checks in 593.13 seconds.
+
+### ARC and Code Golf
+
+- The pinned archive supplied 400 task files, 400 raw solutions and 400 submitted solutions.
+- All seven single-primitive tasks matched the Appendix F counts for primitive, fixed and gated execution.
+- The sequential 400-task Code Golf test confirmed 397/400 in 652.45 seconds. Tasks 157, 205 and 286 returned `error: timeout` at the 60-second limit.
+- Some ARC-GEN inputs exceed the compiler's 30×30 canvas. The task browser and primitive and golf evaluators preserve those inputs. Compiled evaluation records an out-of-canvas input as a failed example.
