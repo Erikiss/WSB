@@ -22,6 +22,8 @@
       <a href="#editor" data-icon="code">Editor</a>
       <a href="#arc" data-icon="grid">ARC / Code Golf</a>
       <a href="#assist" data-icon="spark">Assist</a>
+
+      <a href="#explore" data-icon="spark">Explore</a>
       <a href="#language" data-icon="book">Language</a>
     </nav>
   </header>
@@ -94,6 +96,29 @@
           </div>
         </form>
         <div class="panel"><div class="panel-heading"><h2>Assist results</h2><span class="meta" id="assist-status" aria-live="polite"></span></div><div id="assist-output"></div></div>
+      </div>
+    </section>
+    <section id="explore" class="tab-page" hidden>
+      <div class="page-heading"><h1>Explore loop</h1></div>
+      <div class="assist-layout">
+        <form id="explore-form" class="panel">
+          <div class="panel-heading"><h2>Idea</h2></div>
+          <div class="form-body">
+            <label class="sr-only" for="idea">Describe an idea, in any language</label>
+            <textarea id="idea" required rows="8" placeholder="Describe an idea, in any language. A planner model turns it into a series of measured experiments."></textarea>
+            <label class="field" for="explore-target">Target model<select id="explore-target"><option>pythia-14m</option><option>neox-tiny</option></select></label>
+            <div class="fields">
+              <label class="field" for="explore-rounds">Rounds (1–8)<input id="explore-rounds" type="number" min="1" max="8" step="1" value="3" required></label>
+              <label class="field" for="explore-budget">Budget in USD<input id="explore-budget" type="number" min="0.1" max="5" step="0.1" value="1" required></label>
+            </div>
+            <p class="meta">Each round calls the planner and the three assist models and costs about $0.10–0.20; the final report adds about $0.08. The loop stops before a round that would probably exceed the budget.</p>
+            <div class="actions">
+              <button type="submit" class="primary" id="explore-run" data-icon="play">Start</button>
+              <button type="button" id="explore-cancel" hidden>Cancel</button>
+            </div>
+          </div>
+        </form>
+        <div class="panel"><div class="panel-heading"><h2>Rounds</h2><span class="meta" id="explore-status" aria-live="polite"></span></div><div id="explore-output"></div></div>
       </div>
     </section>
     <section id="language" class="tab-page" hidden>

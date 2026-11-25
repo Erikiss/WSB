@@ -94,7 +94,7 @@ const initialScript = [
 
 function navigate() {
   const id = location.hash.slice(1);
-  activeTab = ['editor','arc','assist','language'].includes(id) ? id : 'editor';
+  activeTab = ['editor','arc','assist','explore','language'].includes(id) ? id : 'editor';
   document.querySelectorAll('.tab-page').forEach(page => { page.hidden = page.id !== activeTab; });
   document.querySelectorAll('.tabs a').forEach(link => {
     if (link.hash === '#' + activeTab) link.setAttribute('aria-current', 'page');
@@ -796,6 +796,116 @@ async function resumeAssist() {
   if (latest.request?.model && [...$('target').options].some(o => o.value === latest.request.model)) $('target').value = latest.request.model;
   await followAssist(latest.assist_id, 'Restored from ' + new Date(latest.created * 1000).toLocaleString());
 }
+// ---- Explore: a planner model runs several assist rounds for one idea -------------------------------------------
+const exploreView = {id: null, revision: -1, rounds: new Map(), token: null};
+function exploreRound(round, output) {
+  let view = exploreView.rounds.get(round.n);
+  if (!view) {
+    const card = el('div','assist-detail explore-round');
+    view = {card, head: el('h3'), note: el('p','meta'), question: el('p'), info: el('p','cost'), problems: el('div'),
+            script: el('details','details-block'), table: el('div'), pane: null};
+    card.append(view.head, view.note, view.question, view.info, view.problems, view.script, view.table);
+    output.append(card);
+    exploreView.rounds.set(round.n, view);
+  }
+  view.head.textContent = 'Round ' + round.n + ' · ' + round.status;
+  view.note.textContent = round.note || '';
+  view.question.textContent = round.question;
+  view.info.textContent = round.assist ? 'Cost · $' + Number(round.cost_usd).toFixed(4) : '';
+  view.problems.replaceChildren();
+  if (round.problem) view.problems.append(notice('No measurement · ' + round.problem));
+  if (round.assist && !view.script.childElementCount) {
+    view.script.append(el('summary','','Script and model replies'), el('pre','raw',round.assist.script),
+      button('Open in editor',()=>openInEditor(round.assist.script)));
+    for (const role of Object.keys(roleDefaults)) {
+      const reply = round.assist.roles[role];
+      view.script.append(el('h4','',role+' · '+(reply?.model||'Skipped')), el('pre','raw',reply?.text || reply?.error || 'No reply.'));
+    }
+  }
+  if (round.verdicts) {
+    if (!view.pane) view.pane = newPane('explore-' + round.n, view.table, el('span'), true);
+    view.pane.id = round.run_id;
+    drawVerdicts(view.pane, round.verdicts);
+  }
+}
+function drawExplore(task) {
+  const status = $('explore-status'), output = $('explore-output');
+  const live = ['running','waiting'].includes(task.status);
+  $('explore-run').disabled = live;
+  $('explore-cancel').hidden = !live;
+  if (task.revision === exploreView.revision) return;
+  exploreView.revision = task.revision;
+  const state = task.state;
+  if (!state) { status.textContent = task.status === 'error' ? 'Error' : 'Planning round 1…'; }
+  else {
+    for (const round of state.rounds) exploreRound(round, output);
+    status.textContent = task.status + ' · ' + state.rounds.length + '/' + state.max_rounds + ' rounds · $' + Number(state.cost_usd).toFixed(4) + ' of $' + Number(state.budget_usd).toFixed(2);
+  }
+  output.querySelectorAll('.explore-extra').forEach(node => node.remove());
+  const extra = el('div','assist-detail explore-extra');
+  for (const item of state?.answers || []) extra.append(el('p','meta','Asked: ' + item.question + ' — Answer: ' + item.answer));
+  if (task.status === 'waiting') {
+    const input = el('input'); input.type = 'text'; input.id = 'explore-answer'; input.setAttribute('aria-label','Your answer');
+    const send = button('Send answer', async () => {
+      if (!input.value.trim()) return;
+      send.disabled = true;
+      try { await request('/api/explore/' + exploreView.id + '/answer', {answer: input.value.trim()}); }
+      catch (error) { send.disabled = false; report(error); }
+    }, 'primary');
+    extra.append(el('h3','','The planner asks'), el('p','',state.waiting), input, send);
+  }
+  if (task.status === 'error') extra.append(notice(task.error.code + ' · ' + task.error.message));
+  if (state?.stopped && !live) extra.append(el('p','meta','Stopped · ' + state.stopped));
+  if (state?.report) extra.append(el('h3','','Report'), el('pre','raw report',state.report));
+  if (state?.report_error) extra.append(notice('No report · ' + state.report_error));
+  if (extra.childElementCount) output.append(extra);
+}
+async function followExplore(id) {
+  const token = exploreView.token = {};
+  for (const key of exploreView.rounds.keys()) clearPane('explore-' + key);
+  Object.assign(exploreView, {id, revision: -1, rounds: new Map()});
+  $('explore-output').replaceChildren();
+  let failures = 0;
+  for (;;) {
+    let task;
+    try { task = await request('/api/explore/' + encodeURIComponent(id)); failures = 0; }
+    catch (error) {
+      if (exploreView.token !== token) return;
+      if (++failures > 30 || /E_NOT_FOUND/.test(error.message)) { $('explore-output').append(notice(error.message)); $('explore-status').textContent = 'Error'; return; }
+      $('explore-status').textContent = 'Connection lost, retrying…';
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      continue;
+    }
+    if (exploreView.token !== token) return;
+    drawExplore(task);
+    if (!['running','waiting'].includes(task.status)) return;
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+}
+async function startExplore(event) {
+  event.preventDefault();
+  $('explore-run').disabled = true;
+  $('explore-status').textContent = 'Starting…';
+  try {
+    const {explore_id} = await request('/api/explore/start', {text: $('idea').value, model: $('explore-target').value,
+      rounds: Number($('explore-rounds').value), budget_usd: Number($('explore-budget').value)});
+    await followExplore(explore_id);
+  } catch (error) { $('explore-output').replaceChildren(notice(error.message)); $('explore-status').textContent = 'Error'; $('explore-run').disabled = false; }
+}
+async function resumeExplore() {
+  let latest;
+  try { latest = (await request('/api/explore/latest')).explore; } catch { return; }
+  if (!latest || exploreView.token) return;
+  if (latest.request?.text && !$('idea').value) $('idea').value = latest.request.text;
+  if ([...$('explore-target').options].some(o => o.value === latest.request?.model)) $('explore-target').value = latest.request.model;
+  await followExplore(latest.explore_id);
+}
+$('explore-form').onsubmit = startExplore;
+$('explore-cancel').onclick = async () => {
+  if (!exploreView.id) return;
+  try { await request('/api/explore/' + exploreView.id + '/cancel', {}); } catch (error) { report(error); }
+};
+$('explore-output').replaceChildren(empty('Describe an idea to start a series of measured rounds.','spark'));
 async function restoreRuns() {
   let runs;
   try { runs = await request('/api/runs'); } catch { return; }
@@ -804,5 +914,6 @@ async function restoreRuns() {
 }
 restoreRuns();
 resumeAssist();
+resumeExplore();
 request('/api/health').then(showHealth).catch(error=>{$('health').textContent=error.message;});
 request('/api/language').then(setupLanguage).catch(report);
