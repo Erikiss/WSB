@@ -8,6 +8,10 @@ from wsbench.lang.printer import print_statement
 from wsbench.lang.validate import validate
 
 
+# Quoted values can contain a literal hash. Only a hash outside a string starts a comment.
+_QUOTED_OR_COMMENT = re.compile(r'("(?:[^"\\]|\\.)*")|#.*$')
+
+
 def failed(verdict, code, message):
     verdict.update(status="ERROR", measured=None, error={"code": code, "message": message})
 
@@ -47,6 +51,8 @@ def prepare(script, predictions=None):
             label = st.display_label
             source = print_statement(st, with_label=False)
         else:
+            if directive is None:
+                source = _QUOTED_OR_COMMENT.sub(lambda m: m[1] or "", raw).strip()
             match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*:(?!=)", source)
             label = match[1] if match else f"line{line}"
         verdict = dict(line=line, label=label, source=source, model=st.model if st else model,
