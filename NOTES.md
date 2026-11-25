@@ -63,3 +63,16 @@ The four-thread CPU run used the unmodified float32 trainer. The validation proc
 - All seven single-primitive tasks matched the Appendix F counts for primitive, fixed and gated execution.
 - The sequential 400-task Code Golf test confirmed 397/400 in 652.45 seconds. Tasks 157, 205 and 286 returned `error: timeout` at the 60-second limit.
 - Some ARC-GEN inputs exceed the compiler's 30×30 canvas. The task browser and primitive and golf evaluators preserve those inputs. Compiled evaluation records an out-of-canvas input as a failed example.
+
+### Browser checklist
+
+| Check | Observed in Chromium |
+|---|---|
+| Load and run the four examples | D.1, D.2 and D.4 completed. D.3 produced live charts and was cancelled for the UI check. The slow suite runs the full D.3 experiment separately. |
+| Inspect R11 | Opened the three heatmaps and switched the selected 16×16 block to three ARC decile grids. |
+| Insert a block edit | Inserted a rotation at the editor cursor and obtained a MEASURED verdict. |
+| Open task150 and compare networks | Golf passed 266/266. The fixed mirror network passed 39/266. The gated network passed 266/266 and offered seven input shapes. |
+| Open task087 in the editor | The selected ARC program opened with its task directive and solve statement. |
+| Inspect training and path charts | The D.3 accuracy and log-loss SVGs rendered. Verified a three-point path chart, then the full D.3 P1 chart on the measured A@200 and A@2000 checkpoints. |
+| Use Assist | Verified the missing-key response and the mock repair, raw replies, five predicted/measured rows, and combined-script editor action. |
+| Narrow display | At 390 px the document fit the viewport. No JavaScript errors occurred during these flows. |

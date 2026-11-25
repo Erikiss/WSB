@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f8fa">
+  <title>WSBench · Editor</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="frame mast-inner">
+      <a class="brand" href="#editor" aria-label="WSBench editor">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        WSBench
+      </a>
+      <div id="health" class="health" role="status">Connecting…</div>
+    </div>
+    <nav class="frame tabs" aria-label="Workspace">
+      <a href="#editor" data-icon="code">Editor</a>
+      <a href="#arc" data-icon="grid">ARC / Code Golf</a>
+      <a href="#assist" data-icon="spark">Assist</a>
+      <a href="#language" data-icon="book">Language</a>
+    </nav>
+  </header>
+  <main class="frame">
+    <section id="editor" class="tab-page">
+      <div class="page-heading">
+        <h1>Experiment editor</h1>
+        <div class="actions">
+          <button id="check" data-icon="check">Check</button>
+          <button id="run" class="primary" data-icon="play">Run</button>
+          <button id="cancel" hidden>Cancel</button>
+        </div>
+      </div>
+      <div class="editor-layout">
+        <div class="panel source-panel">
+          <div class="panel-heading"><h2>Script</h2><select id="examples" aria-label="Load example"><option value="">Load example…</option></select></div>
+          <div class="code-shell">
+            <div class="line-gutter"><div id="line-numbers"></div></div>
+            <div class="code-body">
+              <pre class="highlight" aria-hidden="true"><code id="highlight"></code></pre>
+              <textarea id="source" class="source" aria-label="WSL script" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+            </div>
+          </div>
+          <div class="code-footer"><span id="source-context"></span><span id="cursor"></span></div>
+          <div id="problems" class="problems" aria-live="polite"></div>
+          <section class="palette">
+            <div class="section-heading"><h3>Operation palette</h3><span id="palette-count" class="meta"></span></div>
+            <div id="families" class="segmented" aria-label="Operation family"></div>
+            <div id="ops" class="op-buttons"></div>
+          </section>
+        </div>
+        <div class="panel results-panel">
+          <div class="panel-heading"><h2>Verdicts</h2><span class="meta" id="editor-status" aria-live="polite">Ready</span></div>
+          <div id="editor-results"></div>
+        </div>
+      </div>
+    </section>
+    <section id="arc" class="tab-page" hidden>
+      <div class="page-heading"><h1>ARC / Code Golf</h1><span class="meta" id="task-count"></span></div>
+      <div class="arc-layout">
+        <aside class="panel">
+          <div class="panel-heading"><h2>Task index</h2></div>
+          <div class="task-filters">
+            <label for="task-filter" class="sr-only">Filter by task or ARC ID</label>
+            <input type="search" id="task-filter" placeholder="Filter by task or ARC ID" autocomplete="off">
+            <label class="checkbox"><input type="checkbox" id="single"> Single primitive only</label>
+          </div>
+          <div id="tasks" class="task-list"></div>
+        </aside>
+        <div id="task-detail" class="panel detail-body"></div>
+      </div>
+    </section>
+    <section id="assist" class="tab-page" hidden>
+      <div class="page-heading"><h1>Research assist</h1></div>
+      <div class="assist-layout">
+        <form id="assist-form" class="panel">
+          <div class="panel-heading"><h2>Source text</h2></div>
+          <div class="form-body">
+            <label class="sr-only" for="abstract">Paste a paper abstract or describe an idea</label>
+            <textarea id="abstract" required rows="8" placeholder="Paste a paper abstract or describe an idea"></textarea>
+            <label class="field" for="target">Target model<select id="target"><option>pythia-14m</option><option>neox-tiny</option></select></label>
+            <div class="rule"></div>
+            <h3>Model roles</h3>
+            <div id="role-fields" class="fields"></div>
+            <div id="fable-warning" class="notice" hidden>Fable may refuse prompts that contain other models' output.</div>
+            <div class="actions">
+              <button type="submit" class="primary" id="assist-run" data-icon="play">Translate &amp; run</button>
+              <button type="submit" id="assist-only">Translate only</button>
+            </div>
+          </div>
+        </form>
+        <div class="panel"><div class="panel-heading"><h2>Assist results</h2><span class="meta" id="assist-status" aria-live="polite"></span></div><div id="assist-output"></div></div>
+      </div>
+    </section>
+    <section id="language" class="tab-page" hidden>
+      <div class="page-heading"><h1>Language reference</h1></div>
+      <div class="panel"><div class="panel-heading"><h2>Language card</h2><span class="meta">WSL v0.1</span></div><pre id="language-card" class="language-card"></pre></div>
+      <div class="panel"><div class="panel-heading"><h2>Operations</h2></div><div id="op-table" class="table-wrap"></div></div>
+      <div class="panel"><div class="panel-heading"><h2>Licences and attribution</h2></div><dl class="credits">
+        <dt>WSBench code</dt><dd>MIT</dd>
+        <dt>pythia-14m</dt><dd>Apache-2.0 · EleutherAI</dd>
+        <dt>Code Golf 2025 tasks and solutions</dt><dd>Apache-2.0 · SakanaAI/google-code-golf-2025. Includes ARC-AGI-1 data (Apache-2.0, F. Chollet) and ARC-GEN examples (Apache-2.0, Google).</dd>
+        <dt>Grid-primitive semantics</dt><dd>MIT · michaelhodel/arc-dsl. Reimplemented for WSBench.</dd>
+        <dt>ARC palette</dt><dd>Apache-2.0 · Google Code Golf 2025 utilities</dd>
+      </dl></div>
+    </section>
+    <p id="global-error" class="notice" role="alert" hidden></p>
+  </main>
+</body>
+</html>
