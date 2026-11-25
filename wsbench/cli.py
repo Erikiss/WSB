@@ -1,0 +1,77 @@
+"""Command-line interface to the local workbench."""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def _line(verdict):
+    row = "{label} (line {line}): {status}".format_map(verdict)
+    metrics = verdict["metrics"]
+    if verdict["error"]:
+        return row + " {code}: {message}".format_map(verdict["error"])
+    if verdict["measured"]:
+        row += " measured=" + verdict["measured"]
+    if "dloss" in metrics:
+        row += f" dloss={metrics['dloss']:+.4f}"
+    if "passed" in metrics:
+        row += " passed={passed}/{total}".format_map(metrics)
+    return row
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="wsbench", description="Execute weight-space experiments.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    serve = commands.add_parser("serve", help="start the local web app")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    run = commands.add_parser("run", help="execute a WSL script")
+    run.add_argument("file", type=Path)
+    run.add_argument("--json", type=Path, metavar="OUT.json")
+    check = commands.add_parser("check", help="check WSL syntax, types and hints")
+    check.add_argument("file", type=Path)
+    fetch = commands.add_parser("fetch", help="download the pinned model or ARC corpus")
+    fetch.add_argument("what", choices=["pythia-14m", "arc", "all"])
+    args = parser.parse_args(argv)
+    if args.command == "serve":
+        import uvicorn
+        uvicorn.run("wsbench.server.app:app", host=args.host, port=args.port)
+        return 0
+    if args.command == "fetch":
+        try:
+            if args.what in ("all", "pythia-14m"):
+                from .models.fetch import fetch_pythia
+                fetch_pythia()
+            if args.what in ("all", "arc"):
+                from .arc.data import fetch_arc
+                fetch_arc()
+            return 0
+        except Exception as exc:
+            print(f"E_DOWNLOAD {exc}", file=sys.stderr)
+            return 1
+    try:
+        script = args.file.read_text(encoding="utf-8")
+        if args.command == "check":
+            from .lang.hints import hints
+            from .lang.parser import parse
+            from .lang.validate import validate
+            statements, issues = parse(script)
+            errors = issues + validate(statements)
+            problems = [(e, "error") for e in errors] + [(h, "warning") for h in hints(statements)]
+            for entry, kind in sorted(problems, key=lambda item: (item[0]["line"], item[0]["col"])):
+                print(f"{args.file}:{entry['line']}:{entry['col']}: {kind}: {entry['code']} {entry['message']}")
+            return int(bool(errors))
+        from .exec.executor import run_script
+        results = run_script(script)
+        for verdict in results:
+            print(_line(verdict))
+        if args.json:
+            args.json.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+        return int(any(v["status"] == "ERROR" for v in results))
+    except OSError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
