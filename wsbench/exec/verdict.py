@@ -36,9 +36,9 @@ def prepare(script, predictions=None):
     model = None
     for line, raw in enumerate(script.splitlines(), 1):
         source = raw.partition("#")[0].strip()
-        directive = DIRECTIVE.fullmatch(source)
+        directive = DIRECTIVE.fullmatch(raw)
         if directive and directive[1] == "model":
-            name = directive[2].strip()
+            name = directive[2].partition("#")[0].strip()
             model = name if valid_model(name) else None
         st = by_line.get(line)
         if st is None and line not in errors:
