@@ -164,5 +164,15 @@ def test_live_translation(model_id, monkeypatch):
     result = openrouter.chat("translate", model_id, system, [{
         "role": "user", "content": f"Source text:\n<<<\n{mock.SOURCE_TEXT}\n>>>",
     }])
-    print(f"{model_id} cost USD {result['cost_usd']:.6f}")
-    assert result["ok"] or result["error"]
+    if result["ok"]:
+        outcome = "completion"
+    elif result["finish_reason"] == "content_filter":
+        outcome = "content_filter"
+    else:
+        # Keep provider response bodies and model output out of public CI logs.
+        prefix = (result["error"] or "").partition(":")[0]
+        http_code = prefix.removeprefix("HTTP ")
+        outcome = f"HTTP {http_code}" if http_code.isdigit() else "no usable response"
+    print(f"{model_id} | {outcome} | cost USD {result['cost_usd']:.6f}")
+    if outcome not in {"completion", "content_filter"}:
+        pytest.fail(f"{model_id}: {outcome}", pytrace=False)
