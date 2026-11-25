@@ -67,6 +67,8 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 - The environment and the agent are created once and their IDs are stored in `WSB_HOME/agent.json`; the agent is updated in place when the definition changes. Each conversation is one session with a hard budget (default $2, at most $20), set as a session budget in cents.
 - A turn opens the event stream before it sends the message, answers `agent.custom_tool_use` events with `user.custom_tool_result`, ends on an idle event whose stop reason is not `requires_action`, and after a dropped stream reads the missed events from the event list. Stop sends `user.interrupt` and cancels a running script.
 - Transcripts are stored in `WSB_HOME/agent_history/` and shown again after a reload. After a server restart a conversation is shown as `closed`: the session still exists on the Claude Platform, but this server cannot continue it.
+- A fifth tool, `arxiv_paper`, lets the agent read a paper from arXiv: part 0 gives title, authors, abstract and section headings, parts 1..n give the full text from arXiv's HTML version in pieces of 15,000 characters. The server contacts only arXiv, only for a well-formed arXiv identifier, and caches the text in `WSB_HOME/papers/`. Papers without an HTML version yield the abstract only.
+- First real run (2026-11-25, from the owner's Codespace): one turn with `wsl_check` and `wsl_run`, 52 s, $0.19 list cost.
 - With `WSB_LLM=mock` a scripted stand-in platform answers, for offline use.
 - Not verified live: no Anthropic key was available in the development environment. Tested with stand-in platforms only (event handling, tool execution, budget, errors, storage) and in Chromium in mock mode.
 

@@ -670,7 +670,7 @@ def test_platform_agent_runs_wsbench_tools_and_keeps_a_transcript(client, tmp_pa
     # setup happened once, with a budget in cents and only WSBench's custom tools
     assert platform.created["env"] == 1 and platform.created["agent"] == 1
     assert platform.created["session"][0]["budget"]["max_list_cost"] == {"amount": "150", "currency": "USD"}
-    assert {t["name"] for t in platform.agent_spec["tools"]} == {"wsl_check", "wsl_run", "arc_tasks", "arc_task"}
+    assert {t["name"] for t in platform.agent_spec["tools"]} == {"wsl_check", "wsl_run", "arc_tasks", "arc_task", "arxiv_paper"}
     assert platform.agent_spec["model"]["id"] == "claude-fable-5-2"
     results = [e for e in platform.sent if e["type"] == "user.custom_tool_result"]
     assert [e["custom_tool_use_id"] for e in results] == ["sevt_2", "sevt_4"]
@@ -703,3 +703,29 @@ def test_platform_agent_reports_budget_and_errors(client, monkeypatch):
     conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
     record = _wait_agent(client, conv_id)
     assert record["status"] == "error" and "platform down" in record["error"]
+
+
+def test_arxiv_tool_reads_only_arxiv_and_pages_the_text(tmp_path, monkeypatch):
+    from wsbench.agent import arxiv, tools
+
+    monkeypatch.setenv("WSB_HOME", str(tmp_path))
+    calls = []
+    atom = ("<feed xmlns='http://www.w3.org/2005/Atom'><entry><title>A  Test\nPaper</title><summary>Short abstract.</summary>"
+            "<published>2026-11-23T15:18:30Z</published><author><name>A. Author</name></author></entry></feed>")
+    page = ("<html><head><style>x{}</style></head><body><nav>menu</nav><h2>1 Intro</h2><p>Hello <math alttext='x^2'>"
+            "<mi>x</mi></math> world.</p><script>bad()</script><h2>2 Method</h2><p>" + "word " * 4000 + "</p></body></html>")
+
+    def get(url):
+        calls.append(url)
+        return atom if "export.arxiv.org" in url else page
+
+    overview = arxiv.read("https://arxiv.org/abs/2611.30835v1", 0, get)
+    assert overview["title"] == "A Test Paper" and overview["abstract"] == "Short abstract." and overview["published"] == "2026-11-23"
+    assert overview["headings"] == ["1 Intro", "2 Method"] and overview["text_parts"] == 2
+    first = arxiv.read("2611.30835", 1, get)
+    assert first["text"].startswith("1 Intro\nHello $x^2$ world.") and "menu" not in first["text"] and "bad()" not in first["text"]
+    assert len(calls) == 2 and all("arxiv.org" in url and "2611.30835" in url for url in calls)      # cached after the first read
+    with pytest.raises(ValueError):
+        arxiv.read("2611.30835", 3, get)
+    for bad in ("https://example.com/paper.pdf", "../../etc/passwd", ""):
+        assert "not an arXiv identifier" in tools.execute("arxiv_paper", {"paper": bad}, None)
