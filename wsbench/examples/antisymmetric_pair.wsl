@@ -1,0 +1,13 @@
+model pythia-14m
+seed 0
+# Idea 2: "layers before and after the middle antisymmetric -> the net interpolates in between"
+A1: edit L[mid+1] := neg_writers(L[mid-1])
+A2: edit delete(L[mid+1])
+A3: edit delete(L[mid-1]); delete(L[mid+1])
+A4: edit L[mid+1] := neg(L[mid-1])
+A5: edit L[mid] := lerp(L[mid-1], L[mid+1], 0.5)
+A6: edit delete(L[mid])
+A7: edit swap(L[mid-1], L[mid])
+A8: edit L[mid-1] := lerp(L[mid-1], L[mid], 0.5); L[mid] := L[mid-1]
+A9: gauge L[mid] := align(L[mid] -> L[mid-1])
+A10: edit L[mid-1] := lerp(L[mid-1], align(L[mid] -> L[mid-1]), 0.5); L[mid] := L[mid-1]

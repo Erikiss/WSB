@@ -1,0 +1,20 @@
+model pythia-14m
+seed 0
+# Idea 1: "all weights in the middle layer rotate" - the precise readings
+R1: gauge fold_ln(); rotate(resid, orth1)
+R2: gauge rotate(resid, orth1)
+R3: gauge fold_ln(); rotate(resid, orth)
+R4: gauge fold_ln(); center_writers(); ln_to_rms(); rotate(resid, orth)
+R5: edit rotate(resid, orth, layers=[3], embed=false, unembed=false)
+R6: gauge vo(L[mid].H[0], gl)
+R7: gauge qk(L[mid].H[0], gl, dims=pass)
+R8: gauge qk(L[mid].H[0], gl, dims=all)
+R9: gauge rope_pairs(L[mid].H[0], phis=[0.3, -1.1, 2.0, 0.7], scale=1.7)
+R10: gauge permute(L[mid].mlp, randperm)
+R11: gauge rotate(L[mid].mlp, orth)
+R12: gauge permute(L[mid].heads, perm([1, 0, 3, 2]))
+R13: gauge scale(L[mid].mlp, uniform(0.5, 2))
+R14: reparam fold_ln()
+R15: reparam fold_ln(); center_writers(); ln_to_rms()
+R16: gauge scale(resid, 2)
+R17: approx(0.05) scale(resid, 2)

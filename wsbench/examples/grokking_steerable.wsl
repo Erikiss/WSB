@@ -1,0 +1,11 @@
+model modadd
+seed 0
+# Idea 3: "is grokking steerable? what happens if I steer along grokking?"
+G1: train modadd(run=A, p=97, frac=0.5, steps=2000, seed=0, save=[200, 2000])
+G2: train modadd(run=F, p=97, frac=0.5, steps=2000, seed=0, filter=grokfast(0.98, 2.0))
+G3: train modadd(run=B, p=97, frac=0.5, steps=2000, seed=1, save=[200, 2000])
+G4: train modadd(run=S, p=97, frac=0.5, steps=2000, seed=0, intervene=[at(200, scale(0.7))])
+P1: path lerp(ckpt(A, 200), ckpt(A, 2000), t=[-0.5:2:0.25])
+P2: path add(ckpt(B, 200), diff(ckpt(A, 2000), ckpt(A, 200)), t=[0:1.5:0.25])
+P3: path scale(ckpt(A, 200), c=[1:0.5:-0.1])
+C1: path cosine(diff(ckpt(A, 2000), ckpt(A, 200)), diff(ckpt(B, 2000), ckpt(B, 200)))

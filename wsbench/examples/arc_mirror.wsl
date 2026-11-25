@@ -1,0 +1,12 @@
+model grid:task150
+V1: solve golf()
+V2: solve prim(vmirror)
+V3: solve compile(vmirror, size=fixed)
+V4: solve compile(vmirror, size=gated)
+V5: solve compile(vmirror, size=gated, from=train)
+V6: solve prim(hmirror)
+model grid:task087
+V7: solve chain(prim(vmirror), prim(hmirror))
+V8: solve compile(rot180, size=fixed)
+model pythia-14m
+W1: edit gridop(rot90, block("gpt_neox.layers.3.attention.dense.weight", 0, 64, 0, 64))
