@@ -1,0 +1,15 @@
+{
+  "name": "WSBench",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "bash .devcontainer/start.sh",
+  "forwardPorts": [8765],
+  "portsAttributes": {
+    "8765": { "label": "WSBench", "onAutoForward": "notify" }
+  },
+  "secrets": {
+    "OPENROUTER_API_KEY": {
+      "description": "OpenRouter key for the Assist tab. Optional: without it the app runs, and Assist reports no-key."
+    }
+  }
+}
