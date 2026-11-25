@@ -356,7 +356,7 @@ async function runScript(key, script, target, status) {
   status.textContent = 'Submitting…';
   if (key === 'editor') { $('run').disabled = true; $('cancel').hidden = false; $('cancel').disabled = true; }
   try {
-    const {run_id} = await request('/api/run', {script});
+    const {run_id} = await request('/api/run', {script, source: key === 'editor' ? 'editor' : 'arc'});
     if (!isCurrent(pane)) return;
     if (key === 'editor') $('cancel').disabled = false;
     await poll(pane, run_id);
@@ -744,5 +744,34 @@ setScript(initialScript);
 $('editor-results').replaceChildren(empty('Run the script to see its verdicts.'));
 $('assist-output').replaceChildren(empty('Translate a source text to see the proposed experiments.','spark'));
 navigate();
+// After a reload, show the most recent editor run and assist run again (also runs that are still in progress).
+async function resumeEditor(run) {
+  $('examples').value = '';
+  setScript(run.script);
+  const pane = newPane('editor', $('editor-results'), $('editor-status'));
+  if (['queued','running'].includes(run.status)) { $('run').disabled = true; $('cancel').hidden = false; $('cancel').disabled = false; }
+  try { await poll(pane, run.run_id); }
+  catch (error) { if (isCurrent(pane)) { $('editor-status').textContent = 'Error'; pane.table.replaceChildren(notice(error.message)); } }
+  finally { if (isCurrent(pane)) { $('run').disabled = false; $('cancel').hidden = true; } }
+}
+async function resumeAssist(run) {
+  const output = $('assist-output'), status = $('assist-status');
+  const body = el('div','assist-detail');
+  body.append(el('p','cost','Restored from ' + new Date(run.created * 1000).toLocaleString() + ' · the model replies are not stored'),
+    el('h3','','Combined script'), el('pre','raw',run.script), button('Open in editor',()=>openInEditor(run.script)));
+  const results = el('div');
+  output.replaceChildren(body, results);
+  try { await poll(newPane('assist',results,status,true), run.run_id); }
+  catch (error) { output.append(notice(error.message)); }
+}
+async function restoreRuns() {
+  let runs;
+  try { runs = await request('/api/runs'); } catch { return; }
+  const lastEditor = runs.find(run => run.source === 'editor');
+  const lastAssist = runs.find(run => run.source === 'assist');
+  if (lastEditor && !panes.editor) resumeEditor(lastEditor);
+  if (lastAssist && !panes.assist) resumeAssist(lastAssist);
+}
+restoreRuns();
 request('/api/health').then(showHealth).catch(error=>{$('health').textContent=error.message;});
 request('/api/language').then(setupLanguage).catch(report);

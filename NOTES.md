@@ -33,6 +33,14 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 - Code Golf fixture subsets use the upstream Apache-2.0 licence in `tests/fixtures/golf_mini/LICENSE`.
 - NeoX uses one torch thread for the tiny model and two for Pythia and restores the caller's thread count afterward.
 
+## Run history
+
+- Every script run is stored as a JSON file in `WSB_HOME/history/` (the 50 newest are kept): script, verdicts, status and source (`editor`, `arc` or `assist`). A running script is saved at most every two seconds and when it ends.
+- `GET /api/runs` lists the 20 newest runs. `GET /api/runs/{run_id}` also answers for runs of an earlier server process, and adds `script`, `source` and `created` to the response.
+- After a page reload the Editor shows its most recent run again, including one that is still running, and the Assist tab shows its most recent measured script. The model replies of an assist run are not stored.
+- A run that was in progress when the server stopped is shown as `cancelled`; its unfinished statements get `E_RUNTIME` with the message `interrupted: the server restarted before this statement finished`.
+- Tensor views need the edited weights, which are kept in memory only. For a run of an earlier server process they answer 410 `E_EXPIRED`.
+
 ## Acceptance measurements
 
 - The pinned Pythia download matched all three SHA-256 values. The 76-tensor model yielded 149 probe tokens, loss 4.3176623 and maximum absolute logit 25.84748.

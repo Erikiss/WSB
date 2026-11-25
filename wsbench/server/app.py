@@ -29,6 +29,7 @@ EXAMPLES = Path(__file__).parents[1] / "examples"
 
 class Script(BaseModel):
     script: str
+    source: str = "editor"
 
 
 def error(status, code, message):
@@ -78,7 +79,13 @@ def check(payload: Script):
 
 @app.post("/api/run")
 def run(payload: Script):
-    return {"run_id": jobs.submit(payload.script)}
+    source = payload.source if payload.source in ("editor", "arc") else "editor"
+    return {"run_id": jobs.submit(payload.script, source=source)}
+
+
+@app.get("/api/runs")
+def recent_runs():
+    return jobs.recent()
 
 
 @app.get("/api/runs/{run_id}")
@@ -117,7 +124,7 @@ def arc_compiled(task: str, prim: str, size: str = "fixed", source: str = Query(
 
 @app.post("/api/assist")
 def assist_request(payload: dict):
-    return assist(payload, jobs.submit)
+    return assist(payload, lambda script, predictions=None: jobs.submit(script, predictions, source="assist"))
 
 
 @app.get("/")

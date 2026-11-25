@@ -42,7 +42,7 @@ def finish(client, run_id):
         response = client.get(url)
         assert response.status_code == 200
         job = response.json()
-        assert set(job) == {"run_id", "status", "verdicts", "current_line"}
+        assert set(job) == {"run_id", "status", "verdicts", "current_line", "script", "source", "created"}
         assert job["run_id"] == run_id
         if job["status"] in ("done", "cancelled"):
             assert job["current_line"] is None
@@ -300,3 +300,64 @@ def test_invalid_statement_preserves_quoted_hash_and_context(client):
     assert first["model"] == second["model"] == "neox-tiny"
     assert second["source"] == source
     assert first["error"]["code"] == second["error"]["code"] == "E_SYNTAX"
+
+
+def test_runs_are_stored_and_survive_a_server_restart(client, tmp_path):
+    from wsbench.exec import jobs as jobs_module
+
+    script = "model neox-tiny\nK1: gauge permute(L[1].mlp, randperm)\n"
+    run_id = submit(client, script)
+    done = finish(client, run_id)
+    assert done["script"] == script and done["source"] == "editor"
+    stored = tmp_path / "history" / f"{run_id}.json"
+    assert stored.exists()
+
+    listing = client.get("/api/runs").json()
+    assert listing[0]["run_id"] == run_id
+    assert set(listing[0]) == {"run_id", "status", "source", "created", "script"}
+
+    # a new process has an empty in-memory table and must answer from the stored file
+    fresh = jobs_module.Jobs()
+    again = fresh.snapshot(run_id)
+    assert again["status"] == "done"
+    assert [v["status"] for v in again["verdicts"]] == ["CONFIRMED"]
+    assert fresh.recent()[0]["run_id"] == run_id
+    with pytest.raises(jobs_module.JobError) as expired:
+        fresh.tensors(run_id, 2, "gpt_neox.layers.1.mlp.dense_h_to_4h.weight")
+    assert expired.value.code == "E_EXPIRED"
+    assert fresh.cancel(run_id) == {"ok": True}
+
+
+def test_a_run_interrupted_by_a_restart_is_reported_as_cancelled(client, tmp_path):
+    import json
+    from wsbench.exec import jobs as jobs_module
+    from wsbench.exec.verdict import prepare
+
+    script = "model neox-tiny\nA: gauge fold_ln()\nB: edit delete(L[1])\n"
+    _, verdicts = prepare(script)
+    verdicts[0]["status"] = "CONFIRMED"
+    verdicts[1]["status"] = "RUNNING"
+    run_id = "0" * 31 + "1"
+    folder = tmp_path / "history"
+    folder.mkdir()
+    (folder / f"{run_id}.json").write_text(json.dumps(dict(
+        run_id=run_id, status="running", verdicts=verdicts, current_line=3, script=script, source="editor",
+        created=1.0, predictions=None)))
+    job = client.get(f"/api/runs/{run_id}").json()
+    assert job["status"] == "cancelled" and job["current_line"] is None
+    assert job["verdicts"][0]["status"] == "CONFIRMED"
+    assert job["verdicts"][1]["status"] == "ERROR"
+    assert job["verdicts"][1]["error"]["message"].startswith("interrupted")
+
+
+def test_run_ids_cannot_escape_the_history_folder(client, tmp_path):
+    (tmp_path / "secret.json").write_text("{}")
+    assert_error(client.get("/api/runs/..%2Fsecret"), 404, "E_NOT_FOUND")
+    assert_error(client.get("/api/runs/not-a-run"), 404, "E_NOT_FOUND")
+
+
+def test_arc_and_assist_runs_are_tagged(client):
+    arc = client.post("/api/run", json={"script": "model grid:task087\nsolve prim(rot180)\n", "source": "arc"}).json()["run_id"]
+    assert finish(client, arc)["source"] == "arc"
+    data = client.post("/api/assist", json={"text": "rotate the residual stream", "model": "neox-tiny"}).json()
+    assert finish(client, data["run_id"])["source"] == "assist"
