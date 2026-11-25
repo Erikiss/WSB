@@ -194,3 +194,8 @@ pre.raw, .language-card { white-space: pre-wrap; overflow-wrap: anywhere; font: 
 .results-panel .table-wrap:has(.verdicts), .assist-layout .table-wrap:has(.verdicts), .task-options .table-wrap:has(.verdicts) { max-height: 480px; }
 .verdicts th { position: sticky; top: 0; z-index: 1; }
 .verdicts td:nth-child(6), .verdicts td:nth-child(7), .verdicts td:nth-child(8) { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.explore-round { border-top: 1px solid var(--line, #d9dee7); }
+.explore-round:first-child { border-top: 0; }
+.report { white-space: pre-wrap; }
+#explore-answer { width: 100%; margin: 0 0 .6rem; padding: .5rem .6rem; font: inherit; }

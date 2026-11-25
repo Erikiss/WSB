@@ -13,6 +13,7 @@ from wsbench import __version__
 from wsbench.arc.data import ArcError, arc_local, compiled_preview, list_tasks, task_detail
 from wsbench.arc.render import tensor_view
 from wsbench.assist.pipeline import AssistRequestError, assist
+from wsbench.assist.explore_tasks import tasks as explore_tasks
 from wsbench.assist.tasks import tasks as assist_tasks
 from wsbench.exec.jobs import JobError, jobs
 from wsbench.lang.card import LANGUAGE_CARD
@@ -148,6 +149,49 @@ def assist_status(assist_id: str):
     if record is None:
         return error(404, "E_NOT_FOUND", "unknown assist request")
     return record
+
+
+class Answer(BaseModel):
+    answer: str
+
+
+def _explore_submit(script, predictions=None):
+    return jobs.submit(script, predictions, source="explore")
+
+
+@app.post("/api/explore/start")
+def explore_start(payload: dict):
+    return {"explore_id": explore_tasks.start(payload, _explore_submit, jobs.snapshot, jobs.cancel)}
+
+
+@app.get("/api/explore/latest")
+def explore_latest():
+    return {"explore": explore_tasks.latest()}
+
+
+@app.get("/api/explore/{explore_id}")
+def explore_status(explore_id: str):
+    record = explore_tasks.get(explore_id)
+    if record is None:
+        return error(404, "E_NOT_FOUND", "unknown explore request")
+    return record
+
+
+@app.post("/api/explore/{explore_id}/answer")
+def explore_answer(explore_id: str, payload: Answer):
+    outcome = explore_tasks.answer(explore_id, payload.answer)
+    if outcome is None:
+        return error(404, "E_NOT_FOUND", "unknown explore request")
+    if outcome is False:
+        return error(400, "E_BAD_REQUEST", "this explore request is not waiting for an answer")
+    return {"ok": True}
+
+
+@app.post("/api/explore/{explore_id}/cancel")
+def explore_cancel(explore_id: str):
+    if not explore_tasks.cancel(explore_id):
+        return error(404, "E_NOT_FOUND", "unknown explore request")
+    return {"ok": True}
 
 
 @app.get("/")

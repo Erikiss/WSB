@@ -434,3 +434,96 @@ def test_assist_explains_when_nothing_is_testable(client, monkeypatch):
     data = client.post("/api/assist", json={"text": "KL divergence is never negative", "model": "neox-tiny"}).json()
     assert data["run_id"] is None and data["roles"]["critic"] is None
     assert data["parse_errors"][0]["message"].startswith("no testable statement")
+
+
+def _wait_explore(client, explore_id, until=("done", "cancelled", "error")):
+    deadline = monotonic() + 60
+    while True:
+        task = client.get(f"/api/explore/{explore_id}").json()
+        if task["status"] in until:
+            return task
+        assert monotonic() < deadline, task["status"]
+        sleep(0.05)
+
+
+def test_explore_loop_measures_rounds_and_writes_a_report(client, tmp_path):
+    from wsbench.assist import explore_tasks as module
+
+    response = client.post("/api/explore/start", json={"text": "rotation idea", "model": "neox-tiny", "rounds": 3})
+    explore_id = response.json()["explore_id"]
+    task = _wait_explore(client, explore_id)
+    assert task["status"] == "done" and task["error"] is None
+    state = task["state"]
+    assert state["stopped"] == "planner finished" and len(state["rounds"]) == 1
+    first = state["rounds"][0]
+    assert first["status"] == "done" and first["question"].startswith("A global rotation")
+    assert [v["status"] for v in first["verdicts"]] == ["CONFIRMED", "REFUTED", "MEASURED", "CONFIRMED", "CONFIRMED"]
+    assert [v["agree"] for v in first["verdicts"]][:3] == ["agree", "agree", "agree"]
+    assert state["report"].startswith("Confirmed")
+    assert client.get(f"/api/runs/{first['run_id']}").json()["source"] == "explore"
+    assert client.get("/api/explore/latest").json()["explore"]["explore_id"] == explore_id
+    assert module.ExploreTasks().get(explore_id)["state"]["report"] == state["report"]     # stored on disk
+
+
+def test_explore_waits_for_the_researchers_answer(client):
+    explore_id = client.post("/api/explore/start", json={"text": "[[mock-ask]] idea", "model": "neox-tiny"}).json()["explore_id"]
+    task = _wait_explore(client, explore_id, until=("waiting", "done", "error"))
+    assert task["status"] == "waiting" and task["state"]["waiting"] == "Rotation or permutation first?"
+    assert client.post(f"/api/explore/{explore_id}/answer", json={"answer": "rotation"}).json() == {"ok": True}
+    task = _wait_explore(client, explore_id)
+    assert task["status"] == "done"
+    assert task["state"]["answers"] == [{"question": "Rotation or permutation first?", "answer": "rotation"}]
+    assert len(task["state"]["rounds"]) == 1
+    assert_error(client.post(f"/api/explore/{explore_id}/answer", json={"answer": "again"}), 400, "E_BAD_REQUEST")
+
+
+def test_explore_can_be_cancelled_while_it_waits(client):
+    explore_id = client.post("/api/explore/start", json={"text": "[[mock-ask]] idea", "model": "neox-tiny"}).json()["explore_id"]
+    _wait_explore(client, explore_id, until=("waiting",))
+    assert client.post(f"/api/explore/{explore_id}/cancel").json() == {"ok": True}
+    task = _wait_explore(client, explore_id)
+    assert task["status"] == "cancelled" and task["state"]["rounds"] == [] and task["state"]["report"] is None
+
+
+def test_explore_stops_at_the_budget_and_after_all_rounds(client, monkeypatch):
+    from wsbench.assist import mock, openrouter
+
+    def chat(role, model_id, system, messages):
+        text = mock.PLAN_FIRST if role == "planner" else mock.reply(role, messages)
+        return dict(ok=True, text=text, model=model_id, prompt_tokens=1, completion_tokens=1, cost_usd=0.2,
+                    error=None, finish_reason="stop")
+
+    monkeypatch.setattr(openrouter, "chat", chat)
+    explore_id = client.post("/api/explore/start", json={"text": "idea", "model": "neox-tiny", "rounds": 5,
+                                                         "budget_usd": 1.0}).json()["explore_id"]
+    state = _wait_explore(client, explore_id)["state"]
+    assert state["stopped"] == "budget" and len(state["rounds"]) == 1       # 0.8 per round; a second would exceed 1.0
+    assert state["cost_usd"] <= 1.0 + 0.2                                   # only the report call comes on top
+    explore_id = client.post("/api/explore/start", json={"text": "idea", "model": "neox-tiny", "rounds": 2,
+                                                         "budget_usd": 5.0}).json()["explore_id"]
+    state = _wait_explore(client, explore_id)["state"]
+    assert state["stopped"] == "all rounds used" and len(state["rounds"]) == 2 and state["report"]
+
+
+def test_explore_falls_back_to_a_second_planner_model(client, monkeypatch):
+    from wsbench.assist import mock, openrouter
+
+    def chat(role, model_id, system, messages):
+        refused = role in ("planner", "report") and model_id == "anthropic/claude-fable-5.2"
+        return dict(ok=not refused, text="" if refused else mock.reply(role, messages), model=model_id,
+                    prompt_tokens=1, completion_tokens=1, cost_usd=0.0,
+                    error="content_filter" if refused else None, finish_reason="stop")
+
+    monkeypatch.setattr(openrouter, "chat", chat)
+    explore_id = client.post("/api/explore/start", json={"text": "idea", "model": "neox-tiny"}).json()["explore_id"]
+    state = _wait_explore(client, explore_id)["state"]
+    assert state["stopped"] == "planner finished" and state["report"]
+    assert [c["ok"] for c in state["planner_calls"][:2]] == [False, True]
+
+
+def test_explore_rejects_bad_requests(client):
+    for body in ({"text": "", "model": "neox-tiny"}, {"text": "x", "model": "modadd"},
+                 {"text": "x", "model": "neox-tiny", "rounds": 9}, {"text": "x", "model": "neox-tiny", "budget_usd": 50}):
+        assert_error(client.post("/api/explore/start", json=body), 400, "E_BAD_REQUEST")
+    assert_error(client.get("/api/explore/" + "0" * 32), 404, "E_NOT_FOUND")
+    assert_error(client.post("/api/explore/" + "0" * 32 + "/cancel"), 404, "E_NOT_FOUND")

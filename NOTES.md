@@ -43,6 +43,15 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 - When the translator finds no testable claim, the Assist tab opens the translator's reply and reports `no testable statement`.
 - Tensor views need the edited weights, which are kept in memory only. For a run of an earlier server process they answer 410 `E_EXPIRED`.
 
+## Explore loop
+
+- The Explore tab runs several assist rounds for one idea. A planner model (default: the translate model) writes one testable question per round, sees a digest of the measured verdicts (statements and numbers, no model prose) and writes the next question. A final call writes a short report in the language of the idea.
+- The loop stops when the planner sets `done`, after the requested rounds (1–8, default 3), before a round that would probably exceed the budget (default $1, at most $5; the estimate is the most expensive round so far), or on cancel. The first round always runs, and the report call comes on top of the budget.
+- The planner may ask the researcher at most two questions per loop. The loop then has status `waiting` until `POST /api/explore/{id}/answer` arrives.
+- If the planner model fails or refuses, the critic model is tried for that call.
+- Endpoints: `POST /api/explore/start`, `GET /api/explore/{id}`, `GET /api/explore/latest`, `POST /api/explore/{id}/answer`, `POST /api/explore/{id}/cancel`. State is stored in `WSB_HOME/explore_history/` (the 20 newest are kept) and restored after a reload. A loop that was running when the server stopped is reported as interrupted and does not resume.
+- Live check on pythia-14m (two rounds, a German idea about interchangeable middle layers): 22 statements measured in 94 s for $0.35; the planner model accepted the measured results as input both times.
+
 ## Acceptance measurements
 
 - The pinned Pythia download matched all three SHA-256 values. The 76-tensor model yielded 149 probe tokens, loss 4.3176623 and maximum absolute logit 25.84748.
