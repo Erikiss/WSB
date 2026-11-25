@@ -76,3 +76,10 @@ The four-thread CPU run used the unmodified float32 trainer. The validation proc
 | Inspect training and path charts | The D.3 accuracy and log-loss SVGs rendered. Verified a three-point path chart, then the full D.3 P1 chart on the measured A@200 and A@2000 checkpoints. |
 | Use Assist | Verified the missing-key response and the mock repair, raw replies, five predicted/measured rows, and combined-script editor action. |
 | Narrow display | At 390 px the document fit the viewport. No JavaScript errors occurred during these flows. |
+
+### Assist and final checks
+
+- The mocked three-role pipeline returned all five expected labels, verdicts and agreement values. Its syntax-repair case made one repair call.
+- All three optional live OpenRouter checks skipped because the environment had no `OPENROUTER_API_KEY`. No live calls or charges occurred.
+- The complete offline suite passed 97 tests. The three Appendix A–C kernel files matched the supplied source byte for byte. A wheel installation check loaded the CLI, bundled WSL examples and static application.
+- The Cloud preview on port 3000 uses mock Assist. The verified modular-addition checkpoints are available in this Cloud computer's default cache; the source archive can regenerate them by running the D.3 example.
