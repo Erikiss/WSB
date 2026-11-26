@@ -1,4 +1,5 @@
 """HTTP entry points for the local WSBench application."""
+import json
 import os
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
+from starlette.middleware.gzip import GZipMiddleware
 
 from wsbench import __version__
 from wsbench.arc.data import ArcError, arc_local, compiled_preview, list_tasks, task_detail
@@ -26,7 +28,21 @@ from wsbench.lang.validate import validate
 from wsbench.models.fetch import pythia_local
 from ._catalog import OPS
 
-app = FastAPI(title="WSBench", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+class SafeJSON(JSONResponse):
+    """JSON that survives lone surrogates. They arrive as \\ud800 escapes from browsers and as odd file names from
+    repositories; Python accepts them, but the usual UTF-8 encoding of the response raises and the endpoint answers 500
+    for good. As a fallback they are written as escapes, which JSON.parse accepts."""
+
+    def render(self, content):
+        try:
+            return super().render(content)
+        except UnicodeEncodeError:
+            return json.dumps(content, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
+
+
+app = FastAPI(title="WSBench", version=__version__, docs_url=None, redoc_url=None, openapi_url=None,
+              default_response_class=SafeJSON)
+app.add_middleware(GZipMiddleware, minimum_size=1000)       # transcripts with tool results are large and polled often
 STATIC = Path(__file__).parent / "static"
 EXAMPLES = Path(__file__).parents[1] / "examples"
 
@@ -37,7 +53,7 @@ class Script(BaseModel):
 
 
 def error(status, code, message):
-    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
+    return SafeJSON({"error": {"code": code, "message": message}}, status_code=status)
 
 
 @app.exception_handler(AgentError)
