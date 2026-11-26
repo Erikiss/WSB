@@ -908,11 +908,44 @@ $('explore-cancel').onclick = async () => {
 };
 $('explore-output').replaceChildren(empty('Describe an idea to start a series of measured rounds.','spark'));
 // ---- Agent: a Claude Managed Agent that uses WSBench as its tools ---------------------------------------------------
-const agentView = {id: null, revision: -1, nodes: [], token: null, status: null};
+const agentView = {id: null, nodes: [], token: null, status: null, canContinue: false, key: null, busy: false, polling: false, wake: null, refresh: false};
+function agentError(error) {
+  const box = $('agent-error');
+  box.hidden = !error;
+  box.textContent = error ? (error.message || String(error)) : '';
+}
+// Send, Stop and the hint under the message box follow the state of the conversation.
+function agentButtons() {
+  const live = agentView.status === 'running';
+  const loading = Boolean(agentView.id) && agentView.status == null;
+  $('agent-send').disabled = live || loading || agentView.busy;
+  $('agent-stop').hidden = !live;
+  let mode, placeholder = 'Describe an idea or answer the agent, in any language.';
+  if (live) mode = 'The agent is working. You can stop it or wait for its answer.';
+  else if (loading) mode = 'Loading the conversation…';
+  else if (!agentView.id) mode = 'Your message starts a new conversation.';
+  else if (agentView.canContinue) { mode = 'Your message continues this conversation.'; placeholder = 'Answer the agent or ask a follow-up.'; }
+  else { mode = 'This conversation cannot be continued. Your message starts a new one.'; placeholder = 'Describe a new idea, in any language.'; }
+  $('agent-mode').textContent = mode;
+  $('agent-text').placeholder = placeholder;
+}
+// A sleep that a tap on Send, the browser coming back online or the tab becoming visible again can cut short.
+function nap(ms) {
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); if (agentView.wake === done) agentView.wake = null; resolve(); };
+    const timer = setTimeout(done, ms);
+    agentView.wake = done;
+  });
+}
+function showAgentResult(node, item) {
+  // the verdict table of a wsl_run stands in for its result, unless the run is gone from the server's history
+  if (item.result == null || node.result.childElementCount || (item.name === 'wsl_run' && !node.evicted)) return;
+  node.result.append(el('summary','', node.evicted ? 'Result (run no longer stored)' : 'Result'), el('pre','raw', item.result));
+}
 function agentItem(item, index) {
   let node = agentView.nodes[index];
   if (!node) {
-    node = {root: el('div','assist-detail agent-item agent-' + item.kind), pane: null, table: null, drawn: null};
+    node = {root: el('div','assist-detail agent-item agent-' + item.kind), pane: null, table: null, drawn: null, evicted: false};
     if (item.kind === 'tool') {
       node.head = el('h4');
       node.input = el('details','details-block');
@@ -929,77 +962,133 @@ function agentItem(item, index) {
   }
   if (item.kind !== 'tool') return;
   node.head.textContent = item.name + (item.result == null ? ' · running…' : '');
-  if (item.result != null && !node.result.childElementCount && item.name !== 'wsl_run')
-    node.result.append(el('summary','','Result'), el('pre','raw', item.result));
+  showAgentResult(node, item);
   if (item.run_id && node.drawn !== 'final') {
     if (!node.pane) { node.pane = newPane('agent-' + index, node.table, el('span')); node.pane.id = item.run_id; }
+    const pane = node.pane;
     request('/api/runs/' + item.run_id).then(run => {
-      drawVerdicts(node.pane, run.verdicts);
+      if (!isCurrent(pane)) return;
+      const previous = pane.verdicts.find(v => v.line === pane.selected);
+      drawVerdicts(pane, run.verdicts);
+      const selected = run.verdicts.find(v => v.line === pane.selected);
+      if (selected && (selected.status !== previous?.status || selected.metrics?.curves?.step?.length !== previous?.metrics?.curves?.step?.length)) showDetail(pane, selected);
       if (['done','cancelled'].includes(run.status)) node.drawn = 'final';
-    }).catch(() => {});
+    }).catch(error => {
+      if (!/E_NOT_FOUND/.test(error.message)) return;      // the server forgot this run (it keeps only the newest ones)
+      node.drawn = 'final'; node.evicted = true;
+      showAgentResult(node, item);
+    });
   }
 }
 function drawAgent(record) {
-  const live = record.status === 'running';
   agentView.status = record.status;
   agentView.canContinue = record.status === 'idle' || (record.status === 'error' && Boolean(record.session_id));
-  $('agent-send').disabled = live || (agentView.id && !agentView.canContinue);
-  $('agent-stop').hidden = !live;
+  agentButtons();
   record.items.forEach(agentItem);
-  if (record.revision === agentView.revision) return;
-  agentView.revision = record.revision;
+  // Everything below is drawn again when the revision, the status or the error changes, or after a failed poll.
+  const key = [record.revision, record.status, record.error || '', record.cost_usd ?? ''].join('|');
+  if (key === agentView.key) return;
+  agentView.key = key;
+  $('agent-stop').disabled = false;
   $('agent-status').textContent = record.status + (record.cost_usd != null ? ' · $' + Number(record.cost_usd).toFixed(2) + ' of $' + Number(record.budget_usd).toFixed(2) : '');
   $('agent-output').querySelectorAll('.agent-extra').forEach(node => node.remove());
   const extra = el('div','assist-detail agent-extra');
   const lastItem = record.items[record.items.length - 1];
   if (record.status === 'error' && record.error && !(lastItem?.kind === 'error' && lastItem.text === record.error)) extra.append(notice(record.error));
   const firstMessage = record.items.find(item => item.kind === 'user')?.text;
-  if (record.status === 'error' && !record.session_id && firstMessage) extra.append(button('Send my first message again', async () => {
-    try {
-      const {agent_conv_id} = await request('/api/agent/start', {text: firstMessage, budget_usd: Number(record.budget_usd) || Number($('agent-budget').value)});
-      followAgent(agent_conv_id);
-    } catch (error) { report(error); }
-  }, 'primary'));
-  if (['budget','terminated'].includes(record.status)) extra.append(el('p','meta','This conversation cannot be continued. Start a new one.'));
+  if (record.status === 'error' && !record.session_id && firstMessage) {
+    const problem = notice('');
+    problem.hidden = true;
+    problem.setAttribute('role', 'alert');
+    const again = button('Send my first message again', async () => {
+      again.disabled = true; problem.hidden = true;
+      try {
+        const {agent_conv_id} = await request('/api/agent/start', {text: firstMessage, budget_usd: Number(record.budget_usd) || Number($('agent-budget').value)});
+        followAgent(agent_conv_id, 'running');
+      } catch (error) { again.disabled = false; problem.textContent = error.message; problem.hidden = false; }
+    }, 'primary');
+    extra.append(again, problem);
+  }
+  if (['budget','terminated'].includes(record.status)) extra.append(el('p','meta','This conversation cannot be continued. Your next message starts a new one.'));
   if (record.status === 'error' && record.session_id) extra.append(el('p','meta','The conversation is still open: send a new message to continue.'));
   if (record.console_url) { const link = el('a','', 'Open the session in the Claude Console'); link.href = record.console_url; link.target = '_blank'; link.rel = 'noopener'; extra.append(link); }
   if (extra.childElementCount) $('agent-output').append(extra);
 }
-async function followAgent(id) {
-  const token = agentView.token = {};
-  agentView.nodes.forEach((_, index) => clearPane('agent-' + index));
-  Object.assign(agentView, {id, revision: -1, nodes: []});
-  $('agent-output').replaceChildren();
-  let failures = 0;
-  for (;;) {
-    let record;
-    try { record = await request('/api/agent/' + encodeURIComponent(id)); failures = 0; }
-    catch (error) {
+// Polls the conversation while a turn runs, and a few more times until the tool cards have their final numbers.
+// It never gives up on network errors; it ends when the conversation is not running any more.
+async function agentLoop(id, token) {
+  agentView.polling = true;
+  let failures = 0, settling = 0;
+  try {
+    for (;;) {
+      let record;
+      agentView.refresh = false;
+      try { record = await request('/api/agent/' + encodeURIComponent(id)); failures = 0; }
+      catch (error) {
+        if (agentView.token !== token) return;
+        if (/E_NOT_FOUND/.test(error.message)) {
+          $('agent-output').append(notice(error.message));
+          $('agent-status').textContent = 'Error';
+          Object.assign(agentView, {status: 'error', canContinue: false});
+          agentButtons();
+          return;
+        }
+        failures++;
+        agentView.key = null;                      // the next good answer redraws the label, even at the same revision
+        $('agent-status').textContent = 'Connection lost, retrying…';
+        await nap(Math.min(2000 * failures, 15000));
+        if (agentView.token !== token) return;
+        continue;
+      }
       if (agentView.token !== token) return;
-      if (++failures > 30 || /E_NOT_FOUND/.test(error.message)) { $('agent-output').append(notice(error.message)); $('agent-status').textContent = 'Error'; return; }
-      $('agent-status').textContent = 'Connection lost, retrying…';
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      continue;
+      drawAgent(record);
+      if (agentView.refresh) continue;             // Send or Stop happened while this request was in flight
+      if (record.status === 'running') settling = 0;
+      else if (!agentView.nodes.some(node => node.pane && node.drawn !== 'final') || ++settling > 5) return;
+      await nap(record.status === 'running' ? 1000 : 3000);
+      if (agentView.token !== token) return;
     }
-    if (agentView.token !== token) return;
-    drawAgent(record);
-    await new Promise(resolve => setTimeout(resolve, record.status === 'running' ? 1000 : 4000));
-    if (['budget','terminated'].includes(record.status) || (record.status === 'error' && !record.session_id)) return;
+  } finally {
+    if (agentView.token === token) agentView.polling = false;
   }
+}
+function pollAgent() {                              // make the current conversation refresh now (and keep following it)
+  if (!agentView.id) return;
+  if (agentView.polling) { if (agentView.wake) agentView.wake(); else agentView.refresh = true; }
+  else agentLoop(agentView.id, agentView.token);
+}
+function followAgent(id, status = null) {
+  const token = agentView.token = {};
+  agentView.wake?.();
+  agentView.nodes.forEach((_, index) => clearPane('agent-' + index));
+  Object.assign(agentView, {id, nodes: [], key: null, status, canContinue: false, polling: false, refresh: false});
+  $('agent-output').replaceChildren();
+  agentButtons();
+  return agentLoop(id, token);
 }
 async function sendAgent(event) {
   event.preventDefault();
   const text = $('agent-text').value.trim();
-  if (!text) return;
-  $('agent-send').disabled = true;
+  if (!text || agentView.busy || agentView.status === 'running') return;
+  agentError(null);
+  agentView.busy = true;
+  agentButtons();
   try {
-    if (agentView.id && agentView.canContinue) await request('/api/agent/' + agentView.id + '/message', {text});
-    else {
+    if (agentView.id && agentView.canContinue) {
+      await request('/api/agent/' + agentView.id + '/message', {text});
+      agentView.status = 'running';                // until the next poll says otherwise
+      pollAgent();
+    } else {
       const {agent_conv_id} = await request('/api/agent/start', {text, budget_usd: Number($('agent-budget').value)});
-      followAgent(agent_conv_id);
+      followAgent(agent_conv_id, 'running');
     }
     $('agent-text').value = '';
-  } catch (error) { report(error); $('agent-send').disabled = false; }
+  } catch (error) { agentError(error); pollAgent(); }          // the page may have been out of date: look again
+  finally {
+    agentView.busy = false;
+    agentButtons();
+    if (matchMedia('(any-pointer: fine)').matches) $('agent-text').focus({preventScroll: true});    // not on a tablet: the keyboard would cover the answer
+  }
 }
 async function resumeAgent() {
   let latest;
@@ -1007,16 +1096,32 @@ async function resumeAgent() {
   if (latest && !agentView.token) followAgent(latest.agent_conv_id);
 }
 $('agent-form').onsubmit = sendAgent;
-$('agent-new').onclick = () => {
-  agentView.token = {}; agentView.id = null; agentView.status = null; agentView.canContinue = false; agentView.nodes = [];
+$('agent-new').onclick = async () => {
+  if (agentView.id && agentView.status === 'running') {
+    if (!confirm('The agent is still working. Stop it and start a new conversation?')) return;
+    try { await request('/api/agent/' + agentView.id + '/interrupt', {}); }
+    catch (error) { agentError(error); return; }
+  }
+  agentError(null);
+  agentView.token = {};
+  agentView.wake?.();
+  agentView.nodes.forEach((_, index) => clearPane('agent-' + index));
+  Object.assign(agentView, {id: null, nodes: [], key: null, status: null, canContinue: false, polling: false, refresh: false});
   $('agent-output').replaceChildren(empty('Describe an idea to start a conversation with the agent.','spark'));
-  $('agent-status').textContent = ''; $('agent-send').disabled = false; $('agent-stop').hidden = true;
+  $('agent-status').textContent = '';
+  agentButtons();
 };
 $('agent-stop').onclick = async () => {
   if (!agentView.id) return;
-  try { await request('/api/agent/' + agentView.id + '/interrupt', {}); } catch (error) { report(error); }
+  agentError(null);
+  $('agent-stop').disabled = true;                  // until the next redraw; the interrupt is sent once
+  try { await request('/api/agent/' + agentView.id + '/interrupt', {}); pollAgent(); }
+  catch (error) { $('agent-stop').disabled = false; agentError(error); }
 };
+window.addEventListener('online', pollAgent);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollAgent(); });
 $('agent-output').replaceChildren(empty('Describe an idea to start a conversation with the agent.','spark'));
+agentButtons();
 async function restoreRuns() {
   let runs;
   try { runs = await request('/api/runs'); } catch { return; }

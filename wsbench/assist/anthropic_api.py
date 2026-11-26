@@ -11,6 +11,8 @@ PRICES = {
     "claude-opus-4-8": (5, 25), "claude-sonnet-5-5": (2, 10), "claude-sonnet-5": (2, 10), "claude-haiku-5-5": (0.1, 0.5),
 }
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+CUT_OFF = ("max_tokens", "model_context_window_exceeded")     # the text ends where the limit was hit, not where the model stopped
+DEFAULT_PRICE = (8, 40)
 _client = None
 
 
@@ -32,6 +34,23 @@ def _get_client():
         import anthropic
         _client = anthropic.Anthropic(timeout=180.0, max_retries=2)
     return _client
+
+
+def _prompt_tokens(usage):
+    return (usage.input_tokens or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0) \
+        + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+
+
+def _cost(response, requested):
+    """Estimated cost in USD. With a server-side fallback, the top-level usage covers only the attempt that produced the
+    message; usage.iterations lists every attempt (a declined one is billed too), each with its own model."""
+    usage = response.usage
+    fallback = PRICES.get(response.model, PRICES.get(requested, DEFAULT_PRICE))
+    rows = [(PRICES.get(getattr(hop, "model", None), fallback), _prompt_tokens(hop), getattr(hop, "output_tokens", 0) or 0)
+            for hop in getattr(usage, "iterations", None) or [] if getattr(hop, "type", "") in ("message", "fallback_message")]
+    if not rows:
+        rows = [(fallback, _prompt_tokens(usage), usage.output_tokens or 0)]
+    return sum(prompt * price[0] + completion * price[1] for price, prompt, completion in rows) / 1_000_000
 
 
 def chat(role: str, model_id: str, system: str, messages: list[dict]) -> dict:
@@ -61,18 +80,18 @@ def chat(role: str, model_id: str, system: str, messages: list[dict]) -> dict:
         return result
 
     usage = response.usage
-    prompt = (usage.input_tokens or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0) \
-        + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    prompt = _prompt_tokens(usage)
     completion = usage.output_tokens or 0
-    in_price, out_price = PRICES.get(response.model, PRICES.get(model, (8, 40)))
     text = "".join(block.text for block in response.content if block.type == "text")
     result.update(prompt_tokens=prompt, completion_tokens=completion, text=text, finish_reason=response.stop_reason,
-                  cost_usd=(prompt * in_price + completion * out_price) / 1_000_000)
+                  cost_usd=_cost(response, model))
     if response.model != model:
         result["served_by"] = response.model
     if response.stop_reason == "refusal":
         category = getattr(getattr(response, "stop_details", None), "category", None)
         result["error"] = "refusal" + (f" ({category})" if category else "")
+    elif response.stop_reason in CUT_OFF:
+        result["error"] = f"cut off ({response.stop_reason}): the reply is incomplete"
     elif not text.strip():
         result["error"] = "empty text"
     else:

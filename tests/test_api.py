@@ -596,6 +596,7 @@ class _FakePlatform:
         self.NS, self.turns, self.sent, self.created = NS, list(turns), [], {"env": 0, "agent": 0, "update": 0, "session": []}
         self.history = []
         self.send_fail = None
+        self.list_fail = self.retrieve_fail = None
         self._turn = -1
         outer = self
 
@@ -618,11 +619,29 @@ class _FakePlatform:
         def agent_create(**kw): outer.created["agent"] += 1; outer.agent_spec = kw; return NS(id="agent_1", version=1)
         def agent_update(agent_id, **kw): outer.created["update"] += 1; return NS(id=agent_id, version=2)
         def session_create(**kw): outer.created["session"].append(kw); return NS(id="sesn_1")
-        def session_retrieve(session_id): return NS(usage=NS(list_cost=NS(amount="37", currency="USD")))
+        def session_retrieve(session_id):
+            if outer.retrieve_fail is not None:
+                raise outer.retrieve_fail
+            return NS(usage=NS(list_cost=NS(amount="37", currency="USD")))
+
+        def events_list(session_id, **kw):
+            if outer.list_fail is not None:
+                raise outer.list_fail
+            return list(outer.history)
 
         self.beta = NS(environments=NS(create=env_create), agents=NS(create=agent_create, update=agent_update),
                        sessions=NS(create=session_create, retrieve=session_retrieve,
-                                   events=NS(stream=stream, send=send, list=lambda session_id, **kw: list(outer.history))))
+                                   events=NS(stream=stream, send=send, list=events_list)))
+
+
+def _api_error(status, message="refused"):
+    """A real SDK exception, as the Claude Platform raises it."""
+    import anthropic
+    import httpx2
+    response = httpx2.Response(status, request=httpx2.Request("POST", "https://api.anthropic.com/v1/sessions/x/events"),
+                               json={"error": {"message": message}})
+    kind = {400: anthropic.BadRequestError, 404: anthropic.NotFoundError, 409: anthropic.ConflictError}.get(status, anthropic.APIStatusError)
+    return kind(message, response=response, body=None)
 
 
 def _ev(kind, n, **fields):
@@ -859,7 +878,7 @@ def test_a_tool_result_that_failed_to_send_is_sent_again_after_the_reconnect(cli
     record = _wait_agent(client, conv_id)
     assert record["status"] == "idle" and failures == [1]
     results = [e for e in platform.sent if e["type"] == "user.custom_tool_result"]
-    assert len(results) == 1 and results[0]["custom_tool_use_id"] == "sevt_1" and '"errors": []' in results[0]["content"][0]["text"]
+    assert len(results) == 1 and results[0]["custom_tool_use_id"] == "sevt_1" and '"errors":[]' in results[0]["content"][0]["text"]
     assert [i["kind"] for i in record["items"]].count("tool") == 1            # executed once, delivered once
     assert any(i["kind"] == "note" and "reconnecting" in i["text"] for i in record["items"])
 
@@ -911,7 +930,8 @@ def test_a_failed_turn_and_a_server_restart_can_be_continued(client, tmp_path, m
     assert_error(client.post("/api/agent/" + "0" * 32 + "/message", json={"text": "x"}), 404, "E_NOT_FOUND")
 
 
-def test_stop_during_a_tool_call_ends_the_turn_and_interrupts_again(client, monkeypatch):
+@pytest.mark.parametrize("status", [400, 404, 409])
+def test_stop_during_a_tool_call_ends_the_turn_and_interrupts_again(client, monkeypatch, status):
     from types import SimpleNamespace as NS
     from wsbench.agent import sessions as module
     module_, platform = _platform_client(client, monkeypatch, [[
@@ -919,9 +939,8 @@ def test_stop_during_a_tool_call_ends_the_turn_and_interrupts_again(client, monk
         _ev("session.status_idle", 2, stop_reason=NS(type="requires_action")),
         _ev("session.status_idle", 3, stop_reason=NS(type="end_turn")),
     ]])
-    monkeypatch.setattr(module, "_is_bad_request", lambda exc: isinstance(exc, ValueError))
     # the platform closed the pending call when the interrupt arrived and now refuses the late result
-    platform.send_fail = lambda events: (_ for _ in ()).throw(ValueError("no pending call")) if events[0]["type"] == "user.custom_tool_result" else None
+    platform.send_fail = lambda events: (_ for _ in ()).throw(_api_error(status, "no pending call")) if events[0]["type"] == "user.custom_tool_result" else None
     original = module.agent_tools.execute
 
     def stopping(name, arguments, jobs, should_stop, on_run):
@@ -933,6 +952,113 @@ def test_stop_during_a_tool_call_ends_the_turn_and_interrupts_again(client, monk
     assert record["status"] == "idle", record["error"]
     assert not any(i["kind"] == "note" and "reconnecting" in i["text"] for i in record["items"])
     assert [e["type"] for e in platform.sent].count("user.interrupt") == 1
+
+
+def _one_tool_call_turns():
+    from types import SimpleNamespace as NS
+    return [[_ev("agent.custom_tool_use", 1, name="wsl_check", input={"script": "model neox-tiny\n"}),
+             _ev("session.status_idle", 2, stop_reason=NS(type="requires_action")),
+             _ev("session.status_idle", 3, stop_reason=NS(type="end_turn"))],
+            [_ev("agent.message", 4, content=[NS(type="text", text="next")]), _ev("session.status_idle", 5, stop_reason=NS(type="end_turn"))]]
+
+
+def test_a_refused_tool_result_is_replaced_and_never_blocks_the_conversation(client, monkeypatch):
+    module, platform = _platform_client(client, monkeypatch, _one_tool_call_turns())
+    refused = []
+
+    def fail(events):                                # the platform refuses the content of the first result only
+        if events[0]["type"] == "user.custom_tool_result" and not refused:
+            refused.append(1)
+            raise _api_error(400, "content refused")
+    platform.send_fail = fail
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle", record["error"]
+    results = [e for e in platform.sent if e["type"] == "user.custom_tool_result"]
+    assert len(results) == 1 and "could not deliver" in results[0]["content"][0]["text"] and "HTTP 400" in results[0]["content"][0]["text"]
+    assert any(i["kind"] == "note" and "refused the result" in i["text"] for i in record["items"])
+    client.post(f"/api/agent/{conv_id}/message", json={"text": "go on"})
+    assert _wait_agent(client, conv_id)["status"] == "idle"
+
+    # a call that the platform will not answer at all is dropped with a note, and the next message still goes through
+    module, platform = _platform_client(client, monkeypatch, _one_tool_call_turns())
+    platform.send_fail = lambda events: (_ for _ in ()).throw(_api_error(409, "closed")) if events[0]["type"] == "user.custom_tool_result" else None
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle" and any(i["kind"] == "note" and "no longer accepts" in i["text"] for i in record["items"])
+    client.post(f"/api/agent/{conv_id}/message", json={"text": "go on"})
+    assert _wait_agent(client, conv_id)["status"] == "idle"
+    assert [e["type"] for e in platform.sent if e["type"] == "user.message"] == ["user.message"] * 2
+
+
+def test_authentication_failures_are_not_swallowed_as_refusals(client, monkeypatch):
+    first = _one_tool_call_turns()[0]
+    module, platform = _platform_client(client, monkeypatch, [first, first])          # the stream replays the call after each reconnect
+    platform.send_fail = lambda events: (_ for _ in ()).throw(_api_error(401, "bad key")) if events[0]["type"] == "user.custom_tool_result" else None
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "error" and record["session_id"] == "sesn_1"      # the call stays undelivered; a later message retries it
+
+
+def test_a_refused_settle_does_not_block_the_next_message(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    module, platform = _platform_client(client, monkeypatch, [
+        [_ev("session.status_idle", 1, stop_reason=NS(type="end_turn"))],
+        [_ev("session.status_idle", 2, stop_reason=NS(type="end_turn"))],
+    ])
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    assert _wait_agent(client, conv_id)["status"] == "idle"
+    platform.history = [_ev("agent.custom_tool_use", 91, name="wsl_run", input={})]
+    platform.send_fail = lambda events: (_ for _ in ()).throw(_api_error(404, "no such call")) if events[0]["type"] == "user.custom_tool_result" else None
+    fresh = module.AgentSessions()                  # a new server process
+    fresh._client = platform
+    monkeypatch.setattr(module, "sessions", fresh)
+    import wsbench.server.app as app_module
+    monkeypatch.setattr(app_module, "agent_sessions", fresh)
+    assert client.post(f"/api/agent/{conv_id}/message", json={"text": "welcome back"}).json() == {"ok": True}
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle", record["error"]
+    assert [e["type"] for e in platform.sent].count("user.message") == 2
+    assert any(i["kind"] == "note" and "no longer accepts" in i["text"] for i in record["items"])
+
+
+def test_a_vanished_session_ends_the_conversation_instead_of_failing_every_message(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    module, platform = _platform_client(client, monkeypatch, [[_ev("session.status_idle", 1, stop_reason=NS(type="end_turn"))]])
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    assert _wait_agent(client, conv_id)["status"] == "idle"
+    platform.list_fail = platform.retrieve_fail = _api_error(404, "session not found")
+    fresh = module.AgentSessions()
+    fresh._client = platform
+    monkeypatch.setattr(module, "sessions", fresh)
+    import wsbench.server.app as app_module
+    monkeypatch.setattr(app_module, "agent_sessions", fresh)
+    client.post(f"/api/agent/{conv_id}/message", json={"text": "hello?"})
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "terminated" and "no longer exists" in record["items"][-1]["text"]
+
+    # an archived session answers 409 and counts as gone as well, without a minute of retries
+    platform.list_fail = _api_error(409, "session is archived")
+    assert module._gone(platform.list_fail) and not module._transient(platform.list_fail)
+
+
+def test_lone_surrogates_in_text_do_not_break_the_api_or_the_platform_calls(client, monkeypatch):
+    import json as json_module
+    from wsbench.server.app import SafeJSON
+    module, platform = _platform_client(client, monkeypatch, _one_tool_call_turns())
+    monkeypatch.setattr(module.agent_tools, "execute", lambda *a, **kw: "file \udce9 here")      # a non-UTF-8 name from a cloned repository
+    raw = json_module.dumps({"text": "pre \ud800 post\x00", "budget_usd": 1})                 # browsers send a lone surrogate as an escape
+    response = client.post("/api/agent/start", content=raw, headers={"content-type": "application/json"})
+    assert response.status_code == 200
+    conv_id = response.json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle", record["error"]
+    assert record["items"][0]["text"] == "pre ? post" and client.get("/api/agent/latest").status_code == 200
+    sent = [e for e in platform.sent if e["type"] in ("user.message", "user.custom_tool_result")]
+    assert [e["content"][0]["text"] for e in sent] == ["pre ? post", "file ? here"]
+    sent_text = json_module.dumps(sent, ensure_ascii=False)
+    sent_text.encode("utf-8")                       # the SDK encodes the body like this: no surrogate may be left
+    assert SafeJSON({"x": "a\ud800"}).body == b'{"x":"a\\ud800"}'
 
 
 def test_sending_events_retries_overload_and_stored_ids_follow_the_key(client, tmp_path, monkeypatch):

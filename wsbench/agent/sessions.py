@@ -22,6 +22,7 @@ from wsbench.paths import home
 
 from . import spec as agent_spec
 from . import tools as agent_tools
+from .text import clean, clean_deep
 
 KEEP = 20
 MAX_BUDGET_USD = 20.0
@@ -84,19 +85,23 @@ def _anthropic():
 
 
 def _transient(exc):
-    """Connection problems and overload: worth another try. Everything else (4xx) is a real refusal."""
+    """Connection problems and overload: worth another try. Everything else (4xx) is a real refusal. A 409 is not
+    retried here: the SDK already retries it twice, and the platform answers 409 for an archived session."""
     anthropic = _anthropic()
     if anthropic is None:
         return False
     if isinstance(exc, anthropic.APIConnectionError):
         return True
     status = getattr(exc, "status_code", None)
-    return isinstance(exc, anthropic.APIStatusError) and isinstance(status, int) and (status in (408, 409, 429) or status >= 500)
+    return isinstance(exc, anthropic.APIStatusError) and isinstance(status, int) and (status in (408, 429) or status >= 500)
 
 
-def _is_bad_request(exc):
+def _refused(exc):
+    """The platform understood the request and said no (bad request, unknown id, conflict, too large). Not a refusal:
+    authentication problems, rate limits and server errors."""
     anthropic = _anthropic()
-    return anthropic is not None and isinstance(exc, anthropic.BadRequestError)
+    status = getattr(exc, "status_code", None)
+    return anthropic is not None and isinstance(exc, anthropic.APIStatusError) and status in (400, 404, 409, 413, 422)
 
 
 def _gone(exc):
@@ -106,7 +111,7 @@ def _gone(exc):
         return False
     if isinstance(exc, anthropic.NotFoundError):
         return True
-    return isinstance(exc, anthropic.BadRequestError) and "archived" in str(exc).lower()
+    return isinstance(exc, (anthropic.BadRequestError, anthropic.ConflictError)) and "archived" in str(exc).lower()
 
 
 class AgentSessions:
@@ -206,7 +211,8 @@ class AgentSessions:
     def start(self, text, budget_usd, jobs):
         if not available():
             raise AgentError(400, "E_NO_KEY", "ANTHROPIC_API_KEY is not set on the server")
-        if not isinstance(text, str) or not text.strip():
+        text = clean(text).strip() if isinstance(text, str) else ""
+        if not text:
             raise AgentError(400, "E_BAD_REQUEST", "text must be a non-empty string")
         if isinstance(budget_usd, bool) or not isinstance(budget_usd, (int, float)) or not 0.5 <= budget_usd <= MAX_BUDGET_USD:
             raise AgentError(400, "E_BAD_REQUEST", f"budget_usd must be a number from 0.5 to {MAX_BUDGET_USD}")
@@ -214,7 +220,7 @@ class AgentSessions:
         record = dict(agent_conv_id=conv_id, session_id=None, console_url=None, status="running", created=time.time(),
                       revision=0, budget_usd=float(budget_usd), cost_usd=None, error=None, items=[], seen=[], delivered=[])
         self._register(conv_id, record)
-        self._begin_turn(conv_id, text.strip(), jobs)
+        self._begin_turn(conv_id, text, jobs)
         return conv_id
 
     def _register(self, conv_id, record):
@@ -228,7 +234,8 @@ class AgentSessions:
                 self._results.pop(old, None)
 
     def message(self, conv_id, text, jobs):
-        if not isinstance(text, str) or not text.strip():
+        text = clean(text).strip() if isinstance(text, str) else ""
+        if not text:
             raise AgentError(400, "E_BAD_REQUEST", "text must be a non-empty string")
         with self._lock:
             known = conv_id in self._records
@@ -247,7 +254,7 @@ class AgentSessions:
                 record["resume"] = True
             record.update(status="running", error=None)
             self._control[conv_id]["stop"].clear()
-        self._begin_turn(conv_id, text.strip(), jobs)
+        self._begin_turn(conv_id, text, jobs)
         return {"ok": True}
 
     def interrupt(self, conv_id):
@@ -314,7 +321,14 @@ class AgentSessions:
         try:
             self._run_turn(conv_id, text, jobs)
         except Exception as exc:                   # the page must always get an answer
-            message = f"{type(exc).__name__}: {exc}"[:600]
+            with self._lock:
+                attached = bool(self._records.get(conv_id, {}).get("session_id"))
+            if attached and _gone(exc):             # deleted or archived in the Console, or another API key
+                message = ("The session no longer exists on the Claude Platform (deleted, archived, or the API key "
+                           "belongs to another workspace). Start a new conversation.")
+                self._append(conv_id, {"kind": "error", "text": message}, status="terminated", error="session gone")
+                return
+            message = clean(f"{type(exc).__name__}: {exc}")[:600]
             self._append(conv_id, {"kind": "error", "text": message}, status="error", error=message)
 
     def _send(self, session_id, events):
@@ -352,6 +366,42 @@ class AgentSessions:
                 record["delivered"].append(event_id)
             self._results.get(conv_id, {}).pop(event_id, None)
 
+    def _session_gone(self, session_id):
+        """True only if the platform confirms that the session no longer exists."""
+        try:
+            self.client().beta.sessions.retrieve(session_id=session_id)
+        except Exception as exc:
+            return _gone(exc)
+        return False
+
+    def _send_result(self, conv_id, session_id, event_id, text, stop):
+        """Send a tool result and mark the call delivered. If the platform refuses it, the call is closed (Stop's
+        interrupt closes pending calls) or the content was refused: a short replacement is tried once, and a call
+        that cannot be answered at all is dropped with a note. Only a vanished session or a problem that is not a
+        refusal (connection, authentication) is raised."""
+        def event(body):
+            return {"type": "user.custom_tool_result", "custom_tool_use_id": event_id,
+                    "content": [{"type": "text", "text": clean(body)}]}
+        try:
+            self._send(session_id, [event(text)])
+        except Exception as exc:
+            if not _refused(exc) or self._session_gone(session_id):
+                raise
+            status = getattr(exc, "status_code", "?")
+            if stop.is_set():
+                pass                                # stopped: the platform no longer waits for this result
+            else:
+                try:
+                    self._send(session_id, [event(f"WSBench could not deliver the result of this call (HTTP {status}).")])
+                    self._append(conv_id, {"kind": "note", "text": f"The platform refused the result of a tool call (HTTP {status}); "
+                                                                   "the agent was told that it was lost."})
+                except Exception as again:
+                    if not _refused(again) or self._session_gone(session_id):
+                        raise
+                    self._append(conv_id, {"kind": "note", "text": f"The platform no longer accepts the result of a tool call "
+                                                                   f"(HTTP {status}); it was dropped."})
+        self._mark_delivered(conv_id, event_id)
+
     def _resync(self, conv_id, session_id):
         """Re-attach to a session after a failed turn or a server restart: show what the agent said meanwhile and
         settle tool calls that nobody answered, because the platform refuses a new message while a call is pending."""
@@ -365,14 +415,13 @@ class AgentSessions:
             if kind == "agent.custom_tool_use" and event_id not in answered and event_id not in delivered:
                 with self._lock:
                     kept = self._results.get(conv_id, {}).get(event_id)        # executed here, but the send had failed
-                self._send(session_id, [{"type": "user.custom_tool_result", "custom_tool_use_id": event_id, "content": [
-                    {"type": "text", "text": kept or "WSBench lost the connection during this call, so it did not run. "
-                                                    "Run it again if it is still needed."}]}])
+                self._send_result(conv_id, session_id, event_id,
+                                  kept or "WSBench lost the connection during this call, so it did not run. "
+                                          "Run it again if it is still needed.", self._control[conv_id]["stop"])
                 self._append(conv_id, {"kind": "note", "text": f"A tool call ({getattr(event, 'name', '?')}) was left unanswered; "
                                                                + ("its result was sent now." if kept else "it was settled without running.")})
-                self._mark_delivered(conv_id, event_id)
             elif kind == "agent.message" and event_id and event_id not in known:
-                text = _text(getattr(event, "content", None))
+                text = clean(_text(getattr(event, "content", None)))
                 if text.strip():
                     self._append(conv_id, {"kind": "agent", "text": text})
         with self._lock:
@@ -421,8 +470,8 @@ class AgentSessions:
                             outcome = self._status(conv_id, last_status)
                     if outcome is None:
                         for event in stream:
-                            drops = 0                   # the limit counts consecutive failures
                             outcome = self._handle(conv_id, session_id, event, jobs, stop)
+                            drops = 0                   # the limit counts consecutive failures: an event that was handled
                             if outcome is not None:
                                 break
                         else:
@@ -448,17 +497,9 @@ class AgentSessions:
         self._append(conv_id, **fields)
 
     def _deliver(self, conv_id, session_id, event_id, result, stop):
-        """Send a tool result. A result that the platform no longer wants (the researcher pressed Stop and the
-        interrupt already closed the call) is dropped; any other failure is raised, and the call is retried after the
-        reconnect because it stays undelivered."""
-        event = {"type": "user.custom_tool_result", "custom_tool_use_id": event_id,
-                 "content": [{"type": "text", "text": result}]}
-        try:
-            self._send(session_id, [event])
-        except Exception as exc:
-            if not (stop.is_set() and _is_bad_request(exc)):
-                raise
-        self._mark_delivered(conv_id, event_id)
+        """Send a tool result. A failure that is not a refusal (connection, authentication) is raised, and the call is
+        retried after the reconnect because it stays undelivered; see _send_result for refusals."""
+        self._send_result(conv_id, session_id, event_id, result, stop)
         if stop.is_set():                           # the result may have restarted the agent: stop it again
             try:
                 self.client().beta.sessions.events.send(session_id=session_id, events=[{"type": "user.interrupt"}])
@@ -475,7 +516,7 @@ class AgentSessions:
                     return None
                 record["seen"].append(event_id)
         if kind == "agent.message":
-            text = _text(getattr(event, "content", None))
+            text = clean(_text(getattr(event, "content", None)))
             if text.strip():
                 self._append(conv_id, {"kind": "agent", "text": text})
         elif kind == "agent.custom_tool_use":
@@ -484,7 +525,7 @@ class AgentSessions:
                     return None
                 result = self._results[conv_id].get(event_id)
             if result is None:                      # not executed yet; a result that failed to send is sent again as it is
-                arguments = dict(getattr(event, "input", None) or {})
+                arguments = clean_deep(dict(getattr(event, "input", None) or {}))
                 item = {"kind": "tool", "name": event.name, "input": arguments, "result": None, "run_id": None}
                 self._append(conv_id, item)
 
@@ -502,7 +543,7 @@ class AgentSessions:
             self._mark_delivered(conv_id, getattr(event, "custom_tool_use_id", None))
         elif kind == "session.error":
             detail = getattr(event, "error", None)
-            self._append(conv_id, {"kind": "error", "text": str(getattr(detail, "message", None) or detail or "session error")[:600]})
+            self._append(conv_id, {"kind": "error", "text": clean(str(getattr(detail, "message", None) or detail or "session error"))[:600]})
         elif kind.startswith("session.status_") and not replay:
             return self._status(conv_id, event)
         return None

@@ -66,6 +66,8 @@ def chat(role: str, model_id: str, system: str, messages: list[dict]) -> dict:
         result.update(text=content, finish_reason=reason)
         if reason == "content_filter":
             result["error"] = "content_filter"
+        elif reason == "length":
+            result["error"] = "cut off (length): the reply is incomplete"
         elif not content.strip():
             result["error"] = "empty text"
         else:
