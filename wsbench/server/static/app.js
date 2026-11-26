@@ -1083,7 +1083,7 @@ async function sendAgent(event) {
       followAgent(agent_conv_id, 'running');
     }
     $('agent-text').value = '';
-  } catch (error) { agentError(error); }
+  } catch (error) { agentError(error); pollAgent(); }          // the page may have been out of date: look again
   finally {
     agentView.busy = false;
     agentButtons();
