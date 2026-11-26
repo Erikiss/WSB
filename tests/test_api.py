@@ -594,6 +594,8 @@ class _FakePlatform:
     def __init__(self, turns):
         from types import SimpleNamespace as NS
         self.NS, self.turns, self.sent, self.created = NS, list(turns), [], {"env": 0, "agent": 0, "update": 0, "session": []}
+        self.history = []
+        self.send_fail = None
         self._turn = -1
         outer = self
 
@@ -606,6 +608,8 @@ class _FakePlatform:
             return Stream(list(outer.turns[outer._turn + 1]))
 
         def send(session_id, events):
+            if outer.send_fail is not None:
+                outer.send_fail(events)
             outer.sent.extend(events)
             if events[0]["type"] == "user.message":
                 outer._turn += 1
@@ -618,7 +622,7 @@ class _FakePlatform:
 
         self.beta = NS(environments=NS(create=env_create), agents=NS(create=agent_create, update=agent_update),
                        sessions=NS(create=session_create, retrieve=session_retrieve,
-                                   events=NS(stream=stream, send=send, list=lambda session_id: NS(data=[]))))
+                                   events=NS(stream=stream, send=send, list=lambda session_id, **kw: list(outer.history))))
 
 
 def _ev(kind, n, **fields):
@@ -681,7 +685,8 @@ def test_platform_agent_runs_wsbench_tools_and_keeps_a_transcript(client, tmp_pa
     assert record["items"][-1] == {"kind": "agent", "text": "Gern."} and len(platform.created["session"]) == 1
     assert platform.created["agent"] == 1 and (tmp_path / "agent.json").exists()
     assert client.get("/api/agent/latest").json()["agent"]["agent_conv_id"] == conv_id
-    assert module.AgentSessions().get(conv_id)["status"] == "closed"        # stored; a new process cannot continue it
+    stored = module.AgentSessions().get(conv_id)                           # a new process reads it from disk
+    assert stored["status"] == "idle" and stored["session_id"] == "sesn_1" and "seen" not in stored
 
 
 def test_platform_agent_reports_budget_and_errors(client, monkeypatch):
@@ -803,3 +808,178 @@ def test_session_titles_are_single_line_plain_text(client, monkeypatch):
     assert record["status"] == "idle" and record["items"][0]["text"] == pasted.strip()      # the message itself is sent unchanged
     assert platform.created["session"][0]["title"] == title
     assert [e for e in platform.sent if e["type"] == "user.message"][0]["content"][0]["text"] == pasted.strip()
+
+
+def _platform_client(client, monkeypatch, turns, **kw):
+    from wsbench.agent import sessions as module
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(module, "_sleep", lambda seconds: None)
+    platform = _FakePlatform(turns)
+    monkeypatch.setattr(module.sessions, "_client", platform)
+    return module, platform
+
+
+def test_platform_agent_reports_refusals_and_exhausted_retries_and_stays_usable(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    module, platform = _platform_client(client, monkeypatch, [
+        [_ev("session.status_idle", 1, stop_reason=NS(type="refusal"), stop_details=NS(category="cyber", explanation="not allowed"))],
+        [_ev("session.status_idle", 2, stop_reason=NS(type="retries_exhausted"))],
+        [_ev("agent.message", 3, content=[NS(type="text", text="ok"), NS(type="redacted")]),
+         _ev("session.status_idle", 4, stop_reason=NS(type="end_turn"))],
+    ])
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle" and "declined to answer this turn (cyber): not allowed" in record["items"][-1]["text"]
+    client.post(f"/api/agent/{conv_id}/message", json={"text": "again"})
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle" and "gave up on this turn" in record["items"][-1]["text"]
+    client.post(f"/api/agent/{conv_id}/message", json={"text": "once more"})
+    record = _wait_agent(client, conv_id)
+    assert record["items"][-1] == {"kind": "agent", "text": "ok[withheld by the platform]"}
+
+
+def test_a_tool_result_that_failed_to_send_is_sent_again_after_the_reconnect(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    events = [
+        _ev("agent.custom_tool_use", 1, name="wsl_check", input={"script": "model neox-tiny\nX: gauge fold_ln()\n"}),
+        _ev("session.status_idle", 2, stop_reason=NS(type="requires_action")),
+        _ev("agent.message", 3, content=[NS(type="text", text="done")]),
+        _ev("session.status_idle", 4, stop_reason=NS(type="end_turn")),
+    ]
+    module, platform = _platform_client(client, monkeypatch, [events, events])          # the reconnect opens a new stream
+    platform.history = [_ev("agent.custom_tool_use", 1, name="wsl_check", input={})]
+    failures = []
+
+    def fail_once(events):
+        if events[0]["type"] == "user.custom_tool_result" and not failures:
+            failures.append(1)
+            raise RuntimeError("connection reset")
+    platform.send_fail = fail_once
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle" and failures == [1]
+    results = [e for e in platform.sent if e["type"] == "user.custom_tool_result"]
+    assert len(results) == 1 and results[0]["custom_tool_use_id"] == "sevt_1" and '"errors": []' in results[0]["content"][0]["text"]
+    assert [i["kind"] for i in record["items"]].count("tool") == 1            # executed once, delivered once
+    assert any(i["kind"] == "note" and "reconnecting" in i["text"] for i in record["items"])
+
+
+def test_the_event_history_is_read_through_all_pages(client, monkeypatch):
+    module, platform = _platform_client(client, monkeypatch, [[]])
+    calls = []
+
+    def listing(session_id, **kw):
+        calls.append(kw)
+        return (event for event in [_ev("agent.message", n, content=[]) for n in range(3)])      # an iterator: pages follow
+    platform.beta.sessions.events.list = listing
+    assert len(module.sessions._history("sesn_1")) == 3 and calls == [{"limit": 1000}]
+
+
+def test_a_failed_turn_and_a_server_restart_can_be_continued(client, tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    module, platform = _platform_client(client, monkeypatch, [
+        [_ev("session.status_idle", 1, stop_reason=NS(type="end_turn"))],
+        [_ev("agent.message", 2, content=[NS(type="text", text="back")]), _ev("session.status_idle", 3, stop_reason=NS(type="end_turn"))],
+    ])
+    # the first user message fails to send: the conversation is in error, but its session exists
+    platform.send_fail = lambda events: (_ for _ in ()).throw(RuntimeError("platform down"))
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "error" and record["session_id"] == "sesn_1" and "platform down" in record["error"]
+    platform.send_fail = None
+    client.post(f"/api/agent/{conv_id}/message", json={"text": "retry"})
+    assert _wait_agent(client, conv_id)["status"] == "idle"
+
+    # a new server process: the stored conversation is re-attached; an unanswered call is settled and a missed message shown
+    platform.history = [_ev("agent.message", 90, content=[NS(type="text", text="said while away")]),
+                        _ev("agent.custom_tool_use", 91, name="wsl_run", input={}),
+                        _ev("agent.custom_tool_use", 92, name="wsl_check", input={}),
+                        _ev("user.custom_tool_result", 93, custom_tool_use_id="sevt_92")]
+    fresh = module.AgentSessions()
+    fresh._client = platform
+    monkeypatch.setattr(module, "sessions", fresh)
+    import wsbench.server.app as app_module
+    monkeypatch.setattr(app_module, "agent_sessions", fresh)
+    before = len(platform.sent)
+    assert fresh.get(conv_id)["status"] == "idle"
+    assert client.post(f"/api/agent/{conv_id}/message", json={"text": "welcome back"}).json() == {"ok": True}
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle" and {"kind": "agent", "text": "said while away"} in record["items"]
+    sent = platform.sent[before:]
+    assert [e["type"] for e in sent] == ["user.custom_tool_result", "user.message"]       # settle first, then the message
+    assert sent[0]["custom_tool_use_id"] == "sevt_91" and "did not run" in sent[0]["content"][0]["text"]
+    assert_error(client.post("/api/agent/" + "0" * 32 + "/message", json={"text": "x"}), 404, "E_NOT_FOUND")
+
+
+def test_stop_during_a_tool_call_ends_the_turn_and_interrupts_again(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    from wsbench.agent import sessions as module
+    module_, platform = _platform_client(client, monkeypatch, [[
+        _ev("agent.custom_tool_use", 1, name="wsl_check", input={"script": "model neox-tiny\n"}),
+        _ev("session.status_idle", 2, stop_reason=NS(type="requires_action")),
+        _ev("session.status_idle", 3, stop_reason=NS(type="end_turn")),
+    ]])
+    monkeypatch.setattr(module, "_is_bad_request", lambda exc: isinstance(exc, ValueError))
+    # the platform closed the pending call when the interrupt arrived and now refuses the late result
+    platform.send_fail = lambda events: (_ for _ in ()).throw(ValueError("no pending call")) if events[0]["type"] == "user.custom_tool_result" else None
+    original = module.agent_tools.execute
+
+    def stopping(name, arguments, jobs, should_stop, on_run):
+        module.sessions._control[list(module.sessions._control)[-1]]["stop"].set()      # Stop pressed during the tool (newest conversation)
+        return original(name, arguments, jobs, should_stop, on_run)
+    monkeypatch.setattr(module.agent_tools, "execute", stopping)
+    conv_id = client.post("/api/agent/start", json={"text": "idea"}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle", record["error"]
+    assert not any(i["kind"] == "note" and "reconnecting" in i["text"] for i in record["items"])
+    assert [e["type"] for e in platform.sent].count("user.interrupt") == 1
+
+
+def test_sending_events_retries_overload_and_stored_ids_follow_the_key(client, tmp_path, monkeypatch):
+    from wsbench.agent import sessions as module
+    monkeypatch.setattr(module, "_sleep", lambda seconds: None)
+    monkeypatch.setattr(module, "_transient", lambda exc: isinstance(exc, ConnectionResetError))
+    platform = _FakePlatform([[]])
+    attempts = []
+    platform.send_fail = lambda events: attempts.append(1) or (_ for _ in ()).throw(ConnectionResetError()) if len(attempts) < 3 else None
+    sessions = module.AgentSessions()
+    sessions._client = platform
+    sessions._send("sesn_1", [{"type": "user.interrupt"}])
+    assert len(attempts) == 3 and platform.sent == [{"type": "user.interrupt"}]
+    platform.send_fail = lambda events: (_ for _ in ()).throw(ConnectionResetError())
+    with pytest.raises(ConnectionResetError):
+        sessions._send("sesn_1", [{"type": "user.interrupt"}])
+
+    # live mode: IDs are stored with a fingerprint of the key and not trusted for another key
+    monkeypatch.delenv("WSB_LLM", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key-one")
+    platform = _FakePlatform([[]])
+    sessions = module.AgentSessions()
+    sessions._client = platform
+    ids = sessions.ensure_agent()
+    assert ids["agent_id"] == "agent_1" and (tmp_path / "agent.json").exists()
+    sessions.ensure_agent()
+    assert platform.created["agent"] == 1 and platform.created["env"] == 1
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key-two")
+    sessions.ensure_agent()
+    assert platform.created["agent"] == 2 and platform.created["env"] == 2
+
+    # an agent or environment that is gone: the session create is retried once with fresh resources
+    monkeypatch.setattr(module, "_gone", lambda exc: isinstance(exc, LookupError))
+    real_create, tries = platform.beta.sessions.create, []
+
+    def create(**kw):
+        tries.append(kw)
+        if len(tries) == 1:
+            raise LookupError("agent not found")
+        return real_create(**kw)
+    platform.beta.sessions.create = create
+    assert sessions._create_session("idea", 1.0).id == "sesn_1" and len(tries) == 2 and platform.created["agent"] == 3
+
+    # mock mode never reads or writes the stored IDs
+    (tmp_path / "agent.json").unlink()
+    monkeypatch.setenv("WSB_LLM", "mock")
+    module.AgentSessions().ensure_agent()
+    assert not (tmp_path / "agent.json").exists()
+    monkeypatch.setenv("WSB_ANTHROPIC_WORKSPACE", "wrkspc_01")
+    assert module.console_url("sesn_9") == "https://platform.claude.com/workspaces/wrkspc_01/sessions/sesn_9"

@@ -13,7 +13,7 @@ class MockPlatform:
                       update=lambda agent_id, **kw: NS(id=agent_id, version=2)),
             sessions=NS(create=lambda **kw: NS(id="sesn_mock"),
                         retrieve=lambda session_id: NS(usage=NS(list_cost=NS(amount=str(12 * (self.turn + 1)), currency="USD"))),
-                        events=NS(stream=self._stream, send=self._send, list=lambda session_id: NS(data=[]))),
+                        events=NS(stream=self._stream, send=self._send, list=lambda session_id, **kw: [])),
         )
 
     def _event(self, kind, **fields):
