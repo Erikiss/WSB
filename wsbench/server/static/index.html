@@ -132,6 +132,7 @@
           <div class="form-body">
             <label class="sr-only" for="agent-text">Your message to the agent</label>
             <textarea id="agent-text" required rows="6" placeholder="Describe an idea or answer the agent, in any language."></textarea>
+            <p class="meta" id="agent-mode"></p>
             <label class="field" for="agent-budget">Budget for a new conversation, in USD<input id="agent-budget" type="number" min="0.5" max="20" step="0.5" value="2" required></label>
             <p class="meta">A Claude agent on the Claude Platform plans and reasons; WSBench measures. The agent is billed to your Anthropic credits and stops when the budget is spent. Sessions are kept on the Claude Platform until you delete them there.</p>
             <div id="agent-nokey" class="notice" hidden>Set ANTHROPIC_API_KEY on the server to use the agent.</div>
@@ -140,9 +141,10 @@
               <button type="button" id="agent-new">New conversation</button>
               <button type="button" id="agent-stop" hidden>Stop</button>
             </div>
+            <p id="agent-error" class="notice" role="alert" hidden></p>
           </div>
         </form>
-        <div class="panel"><div class="panel-heading"><h2>Conversation</h2><span class="meta" id="agent-status" aria-live="polite"></span></div><div id="agent-output"></div></div>
+        <div class="panel"><div class="panel-heading"><h2>Conversation</h2><span class="meta" id="agent-status" aria-live="polite"></span></div><div id="agent-output" role="log" aria-live="polite"></div></div>
       </div>
     </section>
     <section id="language" class="tab-page" hidden>

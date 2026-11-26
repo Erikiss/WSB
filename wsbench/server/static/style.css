@@ -176,6 +176,15 @@ pre.raw, .language-card { white-space: pre-wrap; overflow-wrap: anywhere; font: 
   .empty { min-height: 150px; }
   .results-panel { min-height: auto; }
 }
+@media (max-width: 640px) {      /* six tabs: drop the icons; if the row is still wider than the screen it scrolls on its own */
+  .tabs { overflow-x: auto; overflow-y: hidden; padding-bottom: 1px; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tabs a { flex: none; }
+  .tabs .icon { display: none; }
+}
+@media (max-width: 350px) {
+  .tabs a { font-size: 10px; }
+}
 @media (max-width: 510px) {
   .mast-inner { align-items: start; flex-direction: column; padding: 12px 0 9px; gap: 10px; }
   .health { justify-content: start; gap: 5px; }
