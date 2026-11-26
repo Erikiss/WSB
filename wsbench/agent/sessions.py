@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from copy import deepcopy
 from threading import Event, Lock, Thread
 from uuid import uuid4
@@ -32,6 +33,14 @@ class AgentError(Exception):
 
 def available():
     return os.getenv("WSB_LLM") == "mock" or bool(os.getenv("ANTHROPIC_API_KEY"))
+
+
+def session_title(text, limit=60):
+    """A one-line title for the Claude Console. The platform rejects control and format characters in titles
+    (line breaks, tabs, soft hyphens, zero-width characters), which pasted text often contains."""
+    clean = "".join("" if unicodedata.category(ch) == "Cf" else " " if unicodedata.category(ch)[0] in "CZ" else ch
+                    for ch in text)     # format characters vanish; controls and separators become a space
+    return "WSBench: " + " ".join(clean.split())[:limit].rstrip()
 
 
 def _text(blocks):
@@ -206,7 +215,7 @@ class AgentSessions:
             ids = self.ensure_agent()
             session = client.beta.sessions.create(
                 agent={"type": "agent", "id": ids["agent_id"], "version": ids["version"]},
-                environment_id=ids["environment_id"], title="WSBench: " + text[:60],
+                environment_id=ids["environment_id"], title=session_title(text),
                 budget={"type": "limit", "max_list_cost": {"amount": str(int(round(budget * 100))), "currency": "USD"}},
             )
             session_id = session.id

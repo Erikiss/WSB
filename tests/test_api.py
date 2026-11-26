@@ -781,3 +781,25 @@ def test_github_tool_reads_and_searches_a_repository_without_running_it(tmp_path
             github.read("owner/demo", path, base=base)
     for bad in ("../x", "https://evil.example/a/b", "a/b; rm -rf /", "owner"):
         assert "not a GitHub repository" in tools.execute("github_repo", {"repo": bad}, None)
+
+
+def test_session_titles_are_single_line_plain_text(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    from wsbench.agent import sessions as module
+
+    pasted = "Wrong, Not Just Weird: Reasoning Models\u2019\nSelf-Checks\tFlag Va\u00adlues\u200b That\r\nContradict \U0001d438 = 0.19"
+    title = module.session_title(pasted)
+    assert title == "WSBench: Wrong, Not Just Weird: Reasoning Models\u2019 Self-Checks Flag Va"
+    assert module.session_title("Va\u00adlues\u200b ok\x00\x1f!") == "WSBench: Values ok !"
+    import unicodedata
+    assert all(unicodedata.category(ch)[0] != "C" for ch in title) and len(title) <= len("WSBench: ") + 60
+    assert module.session_title("\n\n  \n") == "WSBench: "
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    platform = _FakePlatform([[_ev("session.status_idle", 1, stop_reason=NS(type="end_turn"))]])
+    monkeypatch.setattr(module.sessions, "_client", platform)
+    conv_id = client.post("/api/agent/start", json={"text": pasted}).json()["agent_conv_id"]
+    record = _wait_agent(client, conv_id)
+    assert record["status"] == "idle" and record["items"][0]["text"] == pasted.strip()      # the message itself is sent unchanged
+    assert platform.created["session"][0]["title"] == title
+    assert [e for e in platform.sent if e["type"] == "user.message"][0]["content"][0]["text"] == pasted.strip()

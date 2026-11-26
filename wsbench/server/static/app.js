@@ -950,7 +950,15 @@ function drawAgent(record) {
   $('agent-status').textContent = record.status + (record.cost_usd != null ? ' · $' + Number(record.cost_usd).toFixed(2) + ' of $' + Number(record.budget_usd).toFixed(2) : '');
   $('agent-output').querySelectorAll('.agent-extra').forEach(node => node.remove());
   const extra = el('div','assist-detail agent-extra');
-  if (record.status === 'error' && record.error) extra.append(notice(record.error));
+  const lastItem = record.items[record.items.length - 1];
+  if (record.status === 'error' && record.error && !(lastItem?.kind === 'error' && lastItem.text === record.error)) extra.append(notice(record.error));
+  const firstMessage = record.items.find(item => item.kind === 'user')?.text;
+  if (record.status === 'error' && firstMessage) extra.append(button('Send my first message again', async () => {
+    try {
+      const {agent_conv_id} = await request('/api/agent/start', {text: firstMessage, budget_usd: Number(record.budget_usd) || Number($('agent-budget').value)});
+      followAgent(agent_conv_id);
+    } catch (error) { report(error); }
+  }, 'primary'));
   if (['budget','terminated','closed','error'].includes(record.status)) extra.append(el('p','meta','This conversation cannot be continued. Start a new one.'));
   if (record.console_url) { const link = el('a','', 'Open the session in the Claude Console'); link.href = record.console_url; link.target = '_blank'; link.rel = 'noopener'; extra.append(link); }
   if (extra.childElementCount) $('agent-output').append(extra);
