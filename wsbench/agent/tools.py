@@ -7,13 +7,50 @@ from wsbench.lang.hints import hints
 from wsbench.lang.parser import parse
 from wsbench.lang.validate import validate
 
+from .text import clean_deep
+
 MAX_RESULT_CHARS = 20_000
 RUN_TIMEOUT_S = 20 * 60
 
 
+def _dump(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _size(value):
+    return len(_dump(value))
+
+
 def _json(value):
-    text = json.dumps(value, ensure_ascii=False)
-    return text if len(text) <= MAX_RESULT_CHARS else text[:MAX_RESULT_CHARS] + ' ... [truncated]'
+    """The tool result as compact JSON text. A result over the limit is shortened but stays valid JSON: the longest
+    field loses its tail and the result says what was cut ("truncated", "returned_chars" or "omitted")."""
+    value = clean_deep(value)
+    text = _dump(value)
+    if len(text) <= MAX_RESULT_CHARS:
+        return text
+    value = dict(value) if isinstance(value, dict) else {"result": value}
+    marks = ("truncated", "truncated_field", "returned_chars", "omitted", "omitted_from")
+    for _ in range(12):
+        excess = len(text) - MAX_RESULT_CHARS
+        if excess <= 0:
+            return text
+        key = max((k for k in value if k not in marks), key=lambda k: _size(value[k]), default=None)
+        if key is None:
+            break
+        field = value[key]
+        if isinstance(field, str):
+            keep = max(0, len(field) - excess - 160)         # room for the markers added below
+            value[key] = field[:keep]
+            value.update(truncated=True, truncated_field=key, returned_chars=keep)
+        elif isinstance(field, list) and field:
+            keep = max(0, min(len(field) - 1, int(len(field) * (1 - (excess + 160) / max(_size(field), 1)))))
+            value[key] = field[:keep]
+            value.update(truncated=True, omitted=value.get("omitted", 0) + len(field) - keep, omitted_from=key)
+        else:
+            value[key] = "[too large to show]"
+            value["truncated"] = True
+        text = _dump(value)
+    return _dump({"error": "the result is too large to return", "chars": len(text)})
 
 
 def wsl_check(script):

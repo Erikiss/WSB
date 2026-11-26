@@ -4,6 +4,7 @@ Only arXiv is contacted, and only for a well-formed arXiv identifier. Texts are 
 """
 import json
 import re
+import time
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
@@ -13,7 +14,8 @@ from wsbench.paths import home
 
 USER_AGENT = "wsbench/0.1 (https://github.com/Erikiss/WSB)"
 ARXIV_ID = re.compile(r"(?:arxiv\.org/(?:abs|pdf|html)/|arxiv:)?(\d{4}\.\d{4,5})(v\d+)?", re.IGNORECASE)
-PART_CHARS = 15_000
+PART_CHARS = 12_000                       # a part must fit into one tool result (see tools.MAX_RESULT_CHARS) after JSON escaping
+MISSING_TTL_S = 6 * 3600                  # a paper without an HTML version may get one; ask again after this long
 ATOM = {"a": "http://www.w3.org/2005/Atom"}
 
 
@@ -79,12 +81,15 @@ def _fetch(arxiv_id, get):
     paper = dict(id=arxiv_id, title=clean(entry.find("a:title", ATOM)), abstract=clean(entry.find("a:summary", ATOM)),
                  authors=[clean(a.find("a:name", ATOM)) for a in entry.findall("a:author", ATOM)][:12],
                  published=clean(entry.find("a:published", ATOM))[:10], text="", headings=[])
+    paper["html"], paper["fetched"] = "ok", time.time()
     try:
         parser = _Text()
         parser.feed(get(f"https://arxiv.org/html/{arxiv_id}"))
         paper.update(text=parser.text(), headings=parser.headings[:60])
-    except Exception:
-        pass                                  # older papers have no HTML version: the abstract is all we have
+    except httpx.HTTPStatusError as exc:      # 404/410: older papers (and brand-new ones) have no HTML version
+        paper["html"] = "missing" if exc.response.status_code in (404, 410) else "error"
+    except Exception:                         # rate limit, timeout, outage: temporary, so it must not be cached
+        paper["html"] = "error"
     return paper
 
 
@@ -94,19 +99,32 @@ def _http_get(url):
     return response.text
 
 
+def _usable(cached):
+    """A cached paper is final when it has text, or when its HTML was fetched fine, or when the HTML is known to be
+    missing and that was checked recently. Entries from an outage (or without a record of why they have no text) are fetched again."""
+    if not isinstance(cached, dict) or not isinstance(cached.get("text"), str):
+        return False
+    if cached["text"] or cached.get("html") == "ok":
+        return True
+    return cached.get("html") == "missing" and time.time() - (cached.get("fetched") or 0) < MISSING_TTL_S
+
+
 def load(reference, get=_http_get):
     arxiv_id = parse_id(reference)
     path = home() / "papers" / f"{arxiv_id}.json"
     try:
-        return json.loads(path.read_text("utf-8"))
+        cached = json.loads(path.read_text("utf-8"))
     except (OSError, ValueError):
-        pass
+        cached = None
+    if _usable(cached):
+        return cached
     paper = _fetch(arxiv_id, get)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(paper), "utf-8")
-    except OSError:
-        pass
+    if paper["html"] != "error":                  # an outage is not an answer
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(paper), "utf-8")
+        except OSError:
+            pass
     return paper
 
 
@@ -118,7 +136,8 @@ def read(reference, part=0, get=_http_get):
         return dict(id=paper["id"], title=paper["title"], authors=paper["authors"], published=paper["published"],
                     abstract=paper["abstract"], headings=paper["headings"], text_parts=parts,
                     note="Call again with part=1..text_parts to read the full text." if parts
-                    else "No HTML full text is available for this paper; only the abstract.")
+                    else "arXiv did not deliver the HTML full text just now; only the abstract. Try again later."
+                    if paper.get("html") == "error" else "No HTML full text is available for this paper; only the abstract.")
     if not 1 <= part <= parts:
         raise ValueError(f"part must be between 0 and {parts}")
     return dict(id=paper["id"], part=part, text_parts=parts, text=paper["text"][(part - 1) * PART_CHARS: part * PART_CHARS])
