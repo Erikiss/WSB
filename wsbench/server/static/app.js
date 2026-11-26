@@ -942,7 +942,8 @@ function agentItem(item, index) {
 function drawAgent(record) {
   const live = record.status === 'running';
   agentView.status = record.status;
-  $('agent-send').disabled = live || (agentView.id && record.status !== 'idle');
+  agentView.canContinue = record.status === 'idle' || (record.status === 'error' && Boolean(record.session_id));
+  $('agent-send').disabled = live || (agentView.id && !agentView.canContinue);
   $('agent-stop').hidden = !live;
   record.items.forEach(agentItem);
   if (record.revision === agentView.revision) return;
@@ -950,8 +951,17 @@ function drawAgent(record) {
   $('agent-status').textContent = record.status + (record.cost_usd != null ? ' · $' + Number(record.cost_usd).toFixed(2) + ' of $' + Number(record.budget_usd).toFixed(2) : '');
   $('agent-output').querySelectorAll('.agent-extra').forEach(node => node.remove());
   const extra = el('div','assist-detail agent-extra');
-  if (record.status === 'error' && record.error) extra.append(notice(record.error));
-  if (['budget','terminated','closed','error'].includes(record.status)) extra.append(el('p','meta','This conversation cannot be continued. Start a new one.'));
+  const lastItem = record.items[record.items.length - 1];
+  if (record.status === 'error' && record.error && !(lastItem?.kind === 'error' && lastItem.text === record.error)) extra.append(notice(record.error));
+  const firstMessage = record.items.find(item => item.kind === 'user')?.text;
+  if (record.status === 'error' && !record.session_id && firstMessage) extra.append(button('Send my first message again', async () => {
+    try {
+      const {agent_conv_id} = await request('/api/agent/start', {text: firstMessage, budget_usd: Number(record.budget_usd) || Number($('agent-budget').value)});
+      followAgent(agent_conv_id);
+    } catch (error) { report(error); }
+  }, 'primary'));
+  if (['budget','terminated'].includes(record.status)) extra.append(el('p','meta','This conversation cannot be continued. Start a new one.'));
+  if (record.status === 'error' && record.session_id) extra.append(el('p','meta','The conversation is still open: send a new message to continue.'));
   if (record.console_url) { const link = el('a','', 'Open the session in the Claude Console'); link.href = record.console_url; link.target = '_blank'; link.rel = 'noopener'; extra.append(link); }
   if (extra.childElementCount) $('agent-output').append(extra);
 }
@@ -974,7 +984,7 @@ async function followAgent(id) {
     if (agentView.token !== token) return;
     drawAgent(record);
     await new Promise(resolve => setTimeout(resolve, record.status === 'running' ? 1000 : 4000));
-    if (record.status !== 'running' && record.status !== 'idle') return;
+    if (['budget','terminated'].includes(record.status) || (record.status === 'error' && !record.session_id)) return;
   }
 }
 async function sendAgent(event) {
@@ -983,7 +993,7 @@ async function sendAgent(event) {
   if (!text) return;
   $('agent-send').disabled = true;
   try {
-    if (agentView.id && agentView.status === 'idle') await request('/api/agent/' + agentView.id + '/message', {text});
+    if (agentView.id && agentView.canContinue) await request('/api/agent/' + agentView.id + '/message', {text});
     else {
       const {agent_conv_id} = await request('/api/agent/start', {text, budget_usd: Number($('agent-budget').value)});
       followAgent(agent_conv_id);
@@ -998,7 +1008,7 @@ async function resumeAgent() {
 }
 $('agent-form').onsubmit = sendAgent;
 $('agent-new').onclick = () => {
-  agentView.token = {}; agentView.id = null; agentView.status = null; agentView.nodes = [];
+  agentView.token = {}; agentView.id = null; agentView.status = null; agentView.canContinue = false; agentView.nodes = [];
   $('agent-output').replaceChildren(empty('Describe an idea to start a conversation with the agent.','spark'));
   $('agent-status').textContent = ''; $('agent-send').disabled = false; $('agent-stop').hidden = true;
 };

@@ -58,6 +58,19 @@ def execute(name, arguments, jobs, should_stop=lambda: False, on_run=lambda run_
             return wsl_run(str(arguments.get("script", "")), jobs, should_stop, on_run)
         if name == "arc_tasks":
             return arc_tasks(bool(arguments.get("single_primitive_only", False)), str(arguments.get("contains", "")))
+        if name == "arxiv_paper":
+            from . import arxiv
+            part = arguments.get("part", 0)
+            return _json(arxiv.read(str(arguments.get("paper", "")), part if type(part) is int else 0))
+        if name == "lesswrong_post":
+            from . import lesswrong
+            part = arguments.get("part", 0)
+            return _json(lesswrong.read(str(arguments.get("post", "")), part if type(part) is int else 0))
+        if name == "github_repo":
+            from . import github
+            part = arguments.get("part", 0)
+            return _json(github.read(str(arguments.get("repo", "")), str(arguments.get("path", "")),
+                                     part if type(part) is int else 0, str(arguments.get("search", ""))))
         if name == "arc_task":
             return arc_task(str(arguments.get("task", "")))
         return _json({"error": f"unknown tool {name}"})

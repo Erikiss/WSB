@@ -3,11 +3,17 @@
 One conversation = one Managed Agents session. Each turn runs in a background thread: it opens the event stream,
 sends the researcher's message, answers the agent's custom tool calls from the local executor and records a
 transcript, which is stored in WSB_HOME/agent_history/ and served to the page.
+
+A conversation survives the server: the session lives on the Claude Platform, so after a restart or a failed turn
+the next message first re-attaches (reads the session's history, settles tool calls nobody answered) and then
+continues. Only a terminated session or a spent budget ends a conversation.
 """
+import hashlib
 import json
 import os
 import re
 import time
+import unicodedata
 from copy import deepcopy
 from threading import Event, Lock, Thread
 from uuid import uuid4
@@ -20,8 +26,17 @@ from . import tools as agent_tools
 KEEP = 20
 MAX_BUDGET_USD = 20.0
 CONV_ID = re.compile(r"[0-9a-f]{32}")
-INTERRUPTED = "interrupted: the server restarted during this turn. Start a new conversation."
-CONSOLE_URL = "https://platform.claude.com/workspaces/default/sessions/{}"
+INTERRUPTED = "The server restarted during this turn. You can continue the conversation with a new message."
+HIDDEN = ("seen", "delivered", "resume")        # bookkeeping that the page does not need
+SEND_ATTEMPTS = 6
+MAX_DROPS = 5
+_sleep = time.sleep
+
+
+def console_url(session_id):
+    """Link to the session in the Claude Console. The workspace must be the one the API key belongs to."""
+    workspace = os.getenv("WSB_ANTHROPIC_WORKSPACE", "default").strip() or "default"
+    return f"https://platform.claude.com/workspaces/{workspace}/sessions/{session_id}"
 
 
 class AgentError(Exception):
@@ -34,8 +49,23 @@ def available():
     return os.getenv("WSB_LLM") == "mock" or bool(os.getenv("ANTHROPIC_API_KEY"))
 
 
+def session_title(text, limit=60):
+    """A one-line title for the Claude Console. The platform rejects control and format characters in titles
+    (line breaks, tabs, soft hyphens, zero-width characters), which pasted text often contains."""
+    clean = "".join("" if unicodedata.category(ch) == "Cf" else " " if unicodedata.category(ch)[0] in "CZ" else ch
+                    for ch in text)     # format characters vanish; controls and separators become a space
+    return "WSBench: " + " ".join(clean.split())[:limit].rstrip()
+
+
 def _text(blocks):
-    return "".join(getattr(b, "text", "") for b in (blocks or []) if getattr(b, "type", None) == "text")
+    parts = []
+    for block in blocks or []:
+        kind = getattr(block, "type", None)
+        if kind == "text":
+            parts.append(getattr(block, "text", ""))
+        elif kind == "redacted":
+            parts.append("[withheld by the platform]")
+    return "".join(parts)
 
 
 def _cents(list_cost):
@@ -45,13 +75,48 @@ def _cents(list_cost):
         return None
 
 
+def _anthropic():
+    try:
+        import anthropic
+        return anthropic
+    except ImportError:
+        return None
+
+
+def _transient(exc):
+    """Connection problems and overload: worth another try. Everything else (4xx) is a real refusal."""
+    anthropic = _anthropic()
+    if anthropic is None:
+        return False
+    if isinstance(exc, anthropic.APIConnectionError):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(exc, anthropic.APIStatusError) and isinstance(status, int) and (status in (408, 409, 429) or status >= 500)
+
+
+def _is_bad_request(exc):
+    anthropic = _anthropic()
+    return anthropic is not None and isinstance(exc, anthropic.BadRequestError)
+
+
+def _gone(exc):
+    """The stored agent, environment or session no longer exists (deleted, archived, or another workspace)."""
+    anthropic = _anthropic()
+    if anthropic is None:
+        return False
+    if isinstance(exc, anthropic.NotFoundError):
+        return True
+    return isinstance(exc, anthropic.BadRequestError) and "archived" in str(exc).lower()
+
+
 class AgentSessions:
     def __init__(self, client_factory=None):
-        self._records, self._control = {}, {}
+        self._records, self._control, self._results = {}, {}, {}
         self._lock = Lock()
         self._setup_lock = Lock()
         self._client_factory = client_factory
         self._client = None
+        self._mock_ids = {}
 
     # ---- Anthropic resources ------------------------------------------------------------------------------------
 
@@ -71,27 +136,69 @@ class AgentSessions:
     def _ids_path():
         return home() / "agent.json"
 
-    def ensure_agent(self):
-        """Create the environment and the agent once and reuse their IDs; update the agent when its spec changed."""
-        with self._setup_lock:
+    @staticmethod
+    def _fingerprint():
+        key = os.getenv("ANTHROPIC_API_KEY", "")
+        return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+    def _read_ids(self):
+        if os.getenv("WSB_LLM") == "mock":            # a demo must never write IDs that live mode would trust
+            return dict(self._mock_ids)
+        try:
+            ids = json.loads(self._ids_path().read_text("utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return ids if ids.get("key_fp") == self._fingerprint() else {}      # another key = another workspace
+
+    def _write_ids(self, ids):
+        if os.getenv("WSB_LLM") == "mock":
+            self._mock_ids = dict(ids)
+            return
+        try:
             path = self._ids_path()
-            try:
-                ids = json.loads(path.read_text("utf-8"))
-            except (OSError, ValueError):
-                ids = {}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({**ids, "key_fp": self._fingerprint()}), "utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _find(listing, name):
+        """An existing, unarchived resource of this name (after a wiped WSB_HOME), so nothing is created twice."""
+        try:
+            for item in listing(limit=100):
+                if getattr(item, "name", None) == name and not getattr(item, "archived_at", None):
+                    return item
+        except Exception:
+            pass
+        return None
+
+    def ensure_agent(self, force=False):
+        """Create the environment and the agent once and reuse their IDs; update the agent when its spec changed.
+        IDs are written after every step; force=True forgets the stored IDs (the resources are gone)."""
+        with self._setup_lock:
+            ids = {} if force else self._read_ids()
             client, spec, digest = self.client(), agent_spec.spec(), agent_spec.spec_hash()
             if not ids.get("environment_id"):
-                environment = client.beta.environments.create(
-                    name="wsbench", config={"type": "cloud", "networking": {"type": "limited"}})
+                environment = self._find(lambda **kw: client.beta.environments.list(**kw), "wsbench") or \
+                    client.beta.environments.create(name="wsbench", config={"type": "cloud", "networking": {"type": "limited"}})
                 ids["environment_id"] = environment.id
+                self._write_ids(ids)
+            if ids.get("agent_id") and ids.get("spec_hash") != digest:
+                try:
+                    agent = client.beta.agents.update(ids["agent_id"], **spec)
+                    ids.update(version=agent.version, spec_hash=digest)
+                except Exception as exc:
+                    if not _gone(exc):
+                        raise
+                    ids.pop("agent_id", None)             # the agent was deleted or archived: make a new one
             if not ids.get("agent_id"):
-                agent = client.beta.agents.create(**spec)
+                found = self._find(lambda **kw: client.beta.agents.list(**kw), spec["name"])
+                if found is not None:
+                    agent = client.beta.agents.update(found.id, **spec)
+                else:
+                    agent = client.beta.agents.create(**spec)
                 ids.update(agent_id=agent.id, version=agent.version, spec_hash=digest)
-            elif ids.get("spec_hash") != digest:
-                agent = client.beta.agents.update(ids["agent_id"], **spec)
-                ids.update(version=agent.version, spec_hash=digest)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(ids), "utf-8")
+            self._write_ids(ids)
             return ids
 
     # ---- public API ---------------------------------------------------------------------------------------------
@@ -105,26 +212,40 @@ class AgentSessions:
             raise AgentError(400, "E_BAD_REQUEST", f"budget_usd must be a number from 0.5 to {MAX_BUDGET_USD}")
         conv_id = uuid4().hex
         record = dict(agent_conv_id=conv_id, session_id=None, console_url=None, status="running", created=time.time(),
-                      revision=0, budget_usd=float(budget_usd), cost_usd=None, error=None, items=[], seen=[], answered=[])
+                      revision=0, budget_usd=float(budget_usd), cost_usd=None, error=None, items=[], seen=[], delivered=[])
+        self._register(conv_id, record)
+        self._begin_turn(conv_id, text.strip(), jobs)
+        return conv_id
+
+    def _register(self, conv_id, record):
         with self._lock:
             self._records[conv_id] = record
             self._control[conv_id] = dict(stop=Event())
+            self._results[conv_id] = {}
             for old in sorted(self._records, key=lambda k: self._records[k]["created"])[:-KEEP]:
                 del self._records[old]
                 self._control.pop(old, None)
-        self._begin_turn(conv_id, text.strip(), jobs)
-        return conv_id
+                self._results.pop(old, None)
 
     def message(self, conv_id, text, jobs):
         if not isinstance(text, str) or not text.strip():
             raise AgentError(400, "E_BAD_REQUEST", "text must be a non-empty string")
         with self._lock:
-            record = self._records.get(conv_id)
-            if record is None:
-                raise AgentError(404, "E_NOT_FOUND", "unknown conversation (conversations of an earlier server process cannot be continued)")
-            if record["status"] != "idle":
+            known = conv_id in self._records
+        if not known:                               # a conversation of an earlier server process: re-attach to its session
+            stored = self._load(conv_id)
+            if stored is None or not stored.get("session_id"):
+                raise AgentError(404, "E_NOT_FOUND", "unknown conversation")
+            self._register(conv_id, stored)
+        with self._lock:
+            record = self._records[conv_id]
+            if record["status"] == "error" and record.get("session_id"):
+                record["resume"] = True             # the turn failed: re-sync with the session before sending
+            elif record["status"] != "idle":
                 raise AgentError(400, "E_BAD_REQUEST", f"the conversation is {record['status']}, not waiting for a message")
-            record["status"] = "running"
+            elif not known:
+                record["resume"] = True
+            record.update(status="running", error=None)
             self._control[conv_id]["stop"].clear()
         self._begin_turn(conv_id, text.strip(), jobs)
         return {"ok": True}
@@ -170,7 +291,7 @@ class AgentSessions:
 
     @staticmethod
     def _public(record):
-        return {k: deepcopy(v) for k, v in record.items() if k not in ("seen", "answered")}
+        return {k: deepcopy(v) for k, v in record.items() if k not in HIDDEN}
 
     # ---- one turn -----------------------------------------------------------------------------------------------
 
@@ -193,24 +314,87 @@ class AgentSessions:
         try:
             self._run_turn(conv_id, text, jobs)
         except Exception as exc:                   # the page must always get an answer
-            self._append(conv_id, {"kind": "error", "text": f"{type(exc).__name__}: {exc}"[:600]}, status="error",
-                         error=f"{type(exc).__name__}: {exc}"[:600])
+            message = f"{type(exc).__name__}: {exc}"[:600]
+            self._append(conv_id, {"kind": "error", "text": message}, status="error", error=message)
+
+    def _send(self, session_id, events):
+        """Send events; connection problems and overload are retried with a growing pause."""
+        for attempt in range(SEND_ATTEMPTS):
+            try:
+                return self.client().beta.sessions.events.send(session_id=session_id, events=events)
+            except Exception as exc:
+                if not _transient(exc) or attempt == SEND_ATTEMPTS - 1:
+                    raise
+                _sleep(min(2 ** (attempt + 1), 30))
+
+    def _create_session(self, text, budget):
+        def create(ids):
+            return self.client().beta.sessions.create(
+                agent={"type": "agent", "id": ids["agent_id"], "version": ids["version"]},
+                environment_id=ids["environment_id"], title=session_title(text),
+                budget={"type": "limit", "max_list_cost": {"amount": str(int(round(budget * 100))), "currency": "USD"}},
+            )
+        try:
+            return create(self.ensure_agent())
+        except Exception as exc:
+            if not _gone(exc):
+                raise
+            return create(self.ensure_agent(force=True))       # the stored agent or environment is gone
+
+    def _history(self, session_id):
+        """The whole event history, oldest first. The list is paged, and iterating it follows the pages."""
+        return list(self.client().beta.sessions.events.list(session_id=session_id, limit=1000))
+
+    def _mark_delivered(self, conv_id, event_id):
+        with self._lock:
+            record = self._records.get(conv_id)
+            if record is not None and event_id not in record["delivered"]:
+                record["delivered"].append(event_id)
+            self._results.get(conv_id, {}).pop(event_id, None)
+
+    def _resync(self, conv_id, session_id):
+        """Re-attach to a session after a failed turn or a server restart: show what the agent said meanwhile and
+        settle tool calls that nobody answered, because the platform refuses a new message while a call is pending."""
+        history = self._history(session_id)
+        answered = {getattr(e, "custom_tool_use_id", None) for e in history if getattr(e, "type", "") == "user.custom_tool_result"}
+        with self._lock:
+            known = set(self._records[conv_id]["seen"])
+            delivered = set(self._records[conv_id]["delivered"])
+        for event in history:
+            event_id, kind = getattr(event, "id", None), getattr(event, "type", "")
+            if kind == "agent.custom_tool_use" and event_id not in answered and event_id not in delivered:
+                with self._lock:
+                    kept = self._results.get(conv_id, {}).get(event_id)        # executed here, but the send had failed
+                self._send(session_id, [{"type": "user.custom_tool_result", "custom_tool_use_id": event_id, "content": [
+                    {"type": "text", "text": kept or "WSBench lost the connection during this call, so it did not run. "
+                                                    "Run it again if it is still needed."}]}])
+                self._append(conv_id, {"kind": "note", "text": f"A tool call ({getattr(event, 'name', '?')}) was left unanswered; "
+                                                               + ("its result was sent now." if kept else "it was settled without running.")})
+                self._mark_delivered(conv_id, event_id)
+            elif kind == "agent.message" and event_id and event_id not in known:
+                text = _text(getattr(event, "content", None))
+                if text.strip():
+                    self._append(conv_id, {"kind": "agent", "text": text})
+        with self._lock:
+            record = self._records[conv_id]
+            record["seen"].extend(e.id for e in history if getattr(e, "id", None) and e.id not in known)
+            record["delivered"].extend(i for i in answered if i and i not in record["delivered"])
 
     def _run_turn(self, conv_id, text, jobs):
         client = self.client()
         with self._lock:
             record = self._records[conv_id]
             session_id, budget = record["session_id"], record["budget_usd"]
+            resume = record.pop("resume", False)
             stop = self._control[conv_id]["stop"]
         if session_id is None:
-            ids = self.ensure_agent()
-            session = client.beta.sessions.create(
-                agent={"type": "agent", "id": ids["agent_id"], "version": ids["version"]},
-                environment_id=ids["environment_id"], title="WSBench: " + text[:60],
-                budget={"type": "limit", "max_list_cost": {"amount": str(int(round(budget * 100))), "currency": "USD"}},
-            )
-            session_id = session.id
-            self._append(conv_id, session_id=session_id, console_url=CONSOLE_URL.format(session_id))
+            session_id = self._create_session(text, budget).id
+            self._append(conv_id, session_id=session_id, console_url=console_url(session_id))
+        elif resume:
+            self._resync(conv_id, session_id)
+        if stop.is_set():
+            self._append(conv_id, {"kind": "note", "text": "Stopped before the message was sent."}, status="idle")
+            return
 
         message = {"type": "user.message", "content": [{"type": "text", "text": text}]}
         sent, outcome, drops = False, None, 0
@@ -219,19 +403,25 @@ class AgentSessions:
                 # Stream first, then send: the stream only delivers events that occur after it opens.
                 with client.beta.sessions.events.stream(session_id=session_id) as stream:
                     if not sent:
-                        client.beta.sessions.events.send(session_id=session_id, events=[message])
+                        self._send(session_id, [message])
                         sent = True
                     else:                           # reconnect: the stream has no replay, so read the gap from history
+                        history = self._history(session_id)
+                        for event in history:
+                            if getattr(event, "type", "") == "user.custom_tool_result":
+                                self._mark_delivered(conv_id, getattr(event, "custom_tool_use_id", None))
                         last_status = None
-                        for event in client.beta.sessions.events.list(session_id=session_id).data:
-                            unseen = getattr(event, "id", None) not in self._records[conv_id]["seen"]
-                            if unseen and getattr(event, "type", "").startswith("session.status_"):
+                        for event in history:
+                            with self._lock:
+                                fresh = getattr(event, "id", None) not in self._records[conv_id]["seen"]
+                            if fresh and getattr(event, "type", "").startswith("session.status_"):
                                 last_status = event
                             self._handle(conv_id, session_id, event, jobs, stop, replay=True)
                         if last_status is not None:     # the turn may have ended while we were disconnected
                             outcome = self._status(conv_id, last_status)
                     if outcome is None:
                         for event in stream:
+                            drops = 0                   # the limit counts consecutive failures
                             outcome = self._handle(conv_id, session_id, event, jobs, stop)
                             if outcome is not None:
                                 break
@@ -241,10 +431,10 @@ class AgentSessions:
                 raise
             except Exception as exc:
                 drops += 1
-                if not sent or drops > 5:
+                if not sent or drops > MAX_DROPS:
                     raise
                 self._append(conv_id, {"kind": "note", "text": f"connection lost, reconnecting ({type(exc).__name__})"})
-                time.sleep(min(2 * drops, 10))
+                _sleep(min(2 * drops, 10))
 
         cost = None
         try:
@@ -257,12 +447,30 @@ class AgentSessions:
             fields["cost_usd"] = cost
         self._append(conv_id, **fields)
 
+    def _deliver(self, conv_id, session_id, event_id, result, stop):
+        """Send a tool result. A result that the platform no longer wants (the researcher pressed Stop and the
+        interrupt already closed the call) is dropped; any other failure is raised, and the call is retried after the
+        reconnect because it stays undelivered."""
+        event = {"type": "user.custom_tool_result", "custom_tool_use_id": event_id,
+                 "content": [{"type": "text", "text": result}]}
+        try:
+            self._send(session_id, [event])
+        except Exception as exc:
+            if not (stop.is_set() and _is_bad_request(exc)):
+                raise
+        self._mark_delivered(conv_id, event_id)
+        if stop.is_set():                           # the result may have restarted the agent: stop it again
+            try:
+                self.client().beta.sessions.events.send(session_id=session_id, events=[{"type": "user.interrupt"}])
+            except Exception:
+                pass
+
     def _handle(self, conv_id, session_id, event, jobs, stop, replay=False):
         """Record one event. Returns the conversation's new status when the turn has ended, else None."""
         event_id, kind = getattr(event, "id", None), getattr(event, "type", "")
         with self._lock:
             record = self._records[conv_id]
-            if event_id:
+            if event_id and kind != "agent.custom_tool_use":
                 if event_id in record["seen"]:
                     return None
                 record["seen"].append(event_id)
@@ -272,25 +480,26 @@ class AgentSessions:
                 self._append(conv_id, {"kind": "agent", "text": text})
         elif kind == "agent.custom_tool_use":
             with self._lock:
-                done = event_id in record["answered"]
-                if not done:
-                    record["answered"].append(event_id)
-            if done:
-                return None
-            arguments = dict(getattr(event, "input", None) or {})
-            item = {"kind": "tool", "name": event.name, "input": arguments, "result": None, "run_id": None}
-            self._append(conv_id, item)
+                if event_id in record["delivered"]:
+                    return None
+                result = self._results[conv_id].get(event_id)
+            if result is None:                      # not executed yet; a result that failed to send is sent again as it is
+                arguments = dict(getattr(event, "input", None) or {})
+                item = {"kind": "tool", "name": event.name, "input": arguments, "result": None, "run_id": None}
+                self._append(conv_id, item)
 
-            def on_run(run_id):
-                item["run_id"] = run_id
+                def on_run(run_id):
+                    item["run_id"] = run_id
+                    self._append(conv_id)
+
+                result = agent_tools.execute(event.name, arguments, jobs, stop.is_set, on_run)
+                item["result"] = result
+                with self._lock:
+                    self._results[conv_id][event_id] = result
                 self._append(conv_id)
-
-            result = agent_tools.execute(event.name, arguments, jobs, stop.is_set, on_run)
-            item["result"] = result
-            self._append(conv_id)
-            self.client().beta.sessions.events.send(session_id=session_id, events=[{
-                "type": "user.custom_tool_result", "custom_tool_use_id": event_id,
-                "content": [{"type": "text", "text": result}]}])
+            self._deliver(conv_id, session_id, event_id, result, stop)
+        elif kind == "user.custom_tool_result":
+            self._mark_delivered(conv_id, getattr(event, "custom_tool_use_id", None))
         elif kind == "session.error":
             detail = getattr(event, "error", None)
             self._append(conv_id, {"kind": "error", "text": str(getattr(detail, "message", None) or detail or "session error")[:600]})
@@ -311,9 +520,17 @@ class AgentSessions:
         if reason == "budget_reached":
             self._append(conv_id, {"kind": "note", "text": "The budget of this conversation is spent."})
             return "budget"
-        if reason == "retries_exhausted":
-            self._append(conv_id, {"kind": "error", "text": "The session stopped after repeated errors."})
-            return "error"
+        if reason == "retries_exhausted":           # the turn is dead, but the session accepts a new message
+            self._append(conv_id, {"kind": "error", "text": "The platform gave up on this turn after repeated errors "
+                                   "(overload, a rate limit or a tool limit). Send your message again."})
+            return "idle"
+        if reason == "refusal":                     # a safety classifier declined the answer
+            details = getattr(event, "stop_details", None)
+            category, explanation = getattr(details, "category", None), getattr(details, "explanation", None)
+            self._append(conv_id, {"kind": "error", "text": "The model declined to answer this turn"
+                                   + (f" ({category})" if category else "") + (f": {explanation}" if explanation else "")
+                                   + ". Rephrase and send again."})
+            return "idle"
         return "idle"
 
     # ---- storage ------------------------------------------------------------------------------------------------
@@ -343,10 +560,10 @@ class AgentSessions:
             record = json.loads((home() / "agent_history" / f"agent-{conv_id}.json").read_text("utf-8"))
         except (OSError, ValueError):
             return None
-        if record.get("status") == "running":
+        record.setdefault("seen", [])
+        record.setdefault("delivered", [])
+        if record.get("status") == "running":       # written by a process that no longer exists
             record.update(status="error", error=INTERRUPTED)
-        elif record.get("status") == "idle":
-            record["status"] = "closed"             # the session still exists, but this process cannot continue it
         return record
 
 
