@@ -656,6 +656,26 @@ def test_a_corrupt_file_in_a_read_only_directory_is_still_E_DOWNLOAD(wt103_hub, 
     assert hub.requests == []
 
 
+def card_round_off():
+    """From the card's FACTS line on transfo-xl-wt103: the largest draw in L0 and L1 it knows, which it names as a
+    sample maximum, and the threshold it gives approx(t) for exact symmetries."""
+    card = ' '.join(LANGUAGE_CARD.split())
+    number = r'(\d(?:\.\d+)?e-\d+)'
+    sample = re.search(rf'the largest of [\d,]+ draws was {number}, a sample maximum, not a bound', card)
+    threshold = re.search(rf'use approx\(t\) with t >= {number} for them', card)
+    assert sample and threshold, 'the card no longer gives its largest draw as a sample maximum and a threshold'
+    return float(sample.group(1)), float(threshold.group(1))
+
+
+def test_the_card_gives_approx_a_wt103_threshold_well_above_its_largest_draw():
+    """Assist, Explore and the agent read the card's FACTS as measured facts and take approx thresholds from them. The
+    largest value of a sample is no bound: the card once gave 2e-13, the largest of 104 draws, as the reach of single
+    draws, and a larger sample went past it (2.11e-13, NOTES.md). So the threshold the card gives approx(t) keeps a
+    margin over its largest draw. test_wt103_symmetry_draws_in_l1_stay_within_the_card checks it on the checkpoint."""
+    sample, threshold = card_round_off()
+    assert threshold >= 2 * sample
+
+
 # ---------------------------------------------------------------- the real checkpoint
 
 @pytest.mark.network
@@ -711,18 +731,21 @@ def test_wt103_example_reproduces_the_language_card():
 
 @pytest.mark.network
 def test_wt103_symmetry_draws_in_l1_stay_within_the_card():
-    """The card's FACTS line on transfo-xl-wt103 is no hard bound. Two seed-0 draws in L1, permuting the heads on
-    line 11 and V/O of L1.H1 on line 41, change the log-probabilities by 1.7e-13 and 2.0e-13 relative: more than the
-    'at most 1.4e-13' the card once said, within the 2e-13 it gives for single draws, and exact (at most 1e-9)."""
-    reach = float(re.search(r'where single draws reach (\d(?:\.\d+)?e-\d+);', LANGUAGE_CARD).group(1))
+    """The card's FACTS line on transfo-xl-wt103 gives approx(t) a threshold for exact symmetries. Three draws in L1
+    check it as a reader uses it, in approx(t): permuting the heads on line 11 (1.71e-13) and V/O of L1.H1 with gl on
+    line 41 (1.95e-13), at seed 0 from the sample behind the 2e-13 the card once gave as the reach of single draws,
+    and V/O of L1.H4 with gl on line 250 at seed 39 (2.11e-13), the largest of a later sample, which went past that
+    reach: approx(2e-13) is REFUTED there. A draw depends on the seed and the line only, not on the claim."""
+    threshold = card_round_off()[1]
     fetch.fetch('transfo-xl-wt103')
-    lines = ['model transfo-xl-wt103', 'seed 0', *['#'] * 8, 'P: gauge permute(L1.heads, randperm)', *['#'] * 29,
-             'V: gauge vo(L1.H[1], gl)']
+    claim = f'approx({threshold:g})'
+    lines = ['model transfo-xl-wt103', 'seed 0', *['#'] * 8, f'P: {claim} permute(L1.heads, randperm)', *['#'] * 29,
+             f'V: {claim} vo(L1.H[1], gl)', 'seed 39', *['#'] * 207, f'R: {claim} vo(L1.H[4], gl)']
     rows = {v['label']: v for v in run_script('\n'.join(lines))}
-    assert (rows['P']['line'], rows['V']['line']) == (11, 41)
+    assert [rows[label]['line'] for label in 'PVR'] == [11, 41, 250]
     for row in rows.values():
-        assert (row['status'], row['measured']) == ('CONFIRMED', 'exact') and row['metrics']['rel'] <= reach
-    print(f"permute(L1.heads) {rows['P']['metrics']['rel']:.3e}, vo(L1.H[1]) {rows['V']['metrics']['rel']:.3e}")
+        assert (row['status'], row['measured']) == ('CONFIRMED', 'exact') and row['metrics']['rel'] <= threshold
+    print(', '.join(f"{rows[label]['source']} {rows[label]['metrics']['rel']:.3e}" for label in 'PVR'))
 
 
 @pytest.mark.network
