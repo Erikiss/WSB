@@ -398,6 +398,12 @@ function arcGrid(grid, label) {
 function heatmap(data, scale, label) {
   const h = data.length, w = data[0].length;
   const node = canvas(w, h, label, 'heatmap');
+  if (w >= 8 * h) {
+    // A flat tensor (a 1-D bias, crit.cluster_weight [3 x 1024]) would be a sliver of 1-3 px at the full width under
+    // object-fit: contain. Stretch it instead, at least 8 px per row; square and tall matrices keep contain.
+    node.style.objectFit = 'fill';
+    node.style.minHeight = Math.min(360, Math.max(14, 8 * h)) + 'px';
+  }
   const ctx = node.getContext('2d'), pixels = ctx.createImageData(w,h);
   const blue = [33,102,172], red = [178,24,43];
   let i = 0;

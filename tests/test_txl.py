@@ -1,7 +1,12 @@
 """Transformer-XL: agreement with the Hugging Face reference, symmetries, copy-on-write, loading and fetching."""
+import errno
 import hashlib
+import io
 import json
 import math
+import re
+import statistics
+import threading
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -354,7 +359,7 @@ def test_fetch_helpers(tmp_path, monkeypatch, wt103_hub):
     assert fetch.local(name)
     with pytest.raises(fetch.DownloadError) as info:              # the hashes do not match the files
         fetch.verify(name)
-    assert str(info.value) == 'SHA-256 mismatch; run: wsbench fetch transfo-xl-wt103'
+    assert str(info.value) == 'config.json: SHA-256 mismatch; run: wsbench fetch transfo-xl-wt103'
     assert info.value.code == 'E_DOWNLOAD'
     assert not (directory / 'config.json').exists() and not fetch.local(name)
     with pytest.raises(fetch.DownloadError, match='^run: wsbench fetch transfo-xl-wt103$'):
@@ -423,7 +428,8 @@ def test_an_interrupted_download_leaves_no_partial_file(wt103_hub):
 def test_a_mismatching_download_is_not_kept(wt103_hub):
     hub = wt103_hub
     hub.serve['vocab.json'] = b'not the pinned vocabulary'
-    with pytest.raises(fetch.DownloadError, match='^SHA-256 mismatch; run: wsbench fetch transfo-xl-wt103$'):
+    mismatch = r'^vocab\.json: SHA-256 mismatch; run: wsbench fetch transfo-xl-wt103$'    # the file, not its partial
+    with pytest.raises(fetch.DownloadError, match=mismatch):
         fetch.fetch(hub.name)
     assert sorted(p.name for p in hub.directory.iterdir()) == ['config.json', 'pytorch_model.bin']
 
@@ -443,6 +449,211 @@ def test_the_fetch_command_shows_progress_only_on_a_terminal(monkeypatch, capsys
     cli._progress('pytorch_model.bin', 1088 * 2**20, 1088 * 2**20)
     assert capsys.readouterr().err == ('\rpytorch_model.bin: 512.0 MiB of 1088.0 MiB'
                                        '\rpytorch_model.bin: 1088.0 MiB of 1088.0 MiB\n')
+
+
+# Stand-ins with the sizes that matter for progress lines: below 1 MiB, a size the 1 MiB chunks do not divide, 2 MiB
+SIZES = {'config.json': 856, 'pytorch_model.bin': 3 * 2**20 + 5, 'vocab.json': 2 * 2**20}
+
+
+def unsized(data):
+    """A hub answer without Content-Length, in 40,000-byte pieces: the size is known only at the end."""
+    import httpx
+
+    class Pieces(httpx.SyncByteStream):
+        def __iter__(self):
+            for start in range(0, len(data), 40_000):
+                yield data[start:start + 40_000]
+
+    return lambda request: httpx.Response(200, stream=Pieces())
+
+
+class HungUpTerminal(io.TextIOBase):
+    """stderr on a terminal that has hung up, as under a job disowned before its terminal window was closed."""
+
+    def isatty(self):
+        return True
+
+    def write(self, text):
+        raise OSError(errno.EIO, 'Input/output error')
+
+
+def test_a_progress_callback_that_fails_does_not_fail_the_download(wt103_hub):
+    hub = wt103_hub
+    calls = []
+
+    def hung_up(*args):
+        calls.append(args[0])
+        raise OSError(errno.EIO, 'Input/output error')
+
+    fetch.fetch(hub.name, progress=hung_up)
+    assert calls == ['config.json']                       # not called again, not even for the next files
+    assert hub.requests == list(hub.files)
+    assert sorted(p.name for p in hub.directory.iterdir()) == sorted(hub.files)
+    fetch.verify(hub.name)
+
+
+def test_the_fetch_command_survives_a_terminal_that_hung_up(hub, monkeypatch):
+    import httpx
+    import sys
+    from wsbench import cli
+
+    stand_in = hub('transfo-xl-wt103', sizes=SIZES)                  # large enough for progress lines
+    monkeypatch.setattr(sys, 'stderr', HungUpTerminal())
+    assert cli.main(['fetch', 'transfo-xl-wt103']) == 0             # no progress, but every file
+    fetch.verify(stand_in.name)
+    (stand_in.directory / 'vocab.json').unlink()
+    stand_in.serve['vocab.json'] = lambda request: httpx.Response(503)
+    assert cli.main(['fetch', 'transfo-xl-wt103']) == 1             # E_DOWNLOAD cannot be shown either
+
+
+def test_fetch_reports_the_end_of_each_file_once(hub):
+    stand_in = hub('transfo-xl-wt103', sizes=SIZES)
+    stand_in.serve['vocab.json'] = unsized(stand_in.files['vocab.json'])
+    seen = []
+    fetch.fetch(stand_in.name, progress=lambda *args: seen.append(args))
+    for file, size in SIZES.items():
+        calls = [(received, total) for name, received, total in seen if name == file]
+        assert [call for call in calls if call[0] == call[1]] == [(size, size)] == calls[-1:], file
+        assert {total for _, total in calls[:-1]} <= {None if file == 'vocab.json' else size}, file
+
+
+def test_the_fetch_command_ends_every_progress_line(hub, monkeypatch, capsys):
+    """On a terminal: no line for a file below 1 MiB, also when its size is unknown; one line per larger file, which
+    ends with the file, also when its size is unknown."""
+    import sys
+    from wsbench import cli
+
+    stand_in = hub('transfo-xl-wt103', sizes=SIZES)
+    for file in ('config.json', 'vocab.json'):
+        stand_in.serve[file] = unsized(stand_in.files[file])
+    monkeypatch.setattr(sys.stderr, 'isatty', lambda: True)
+    assert cli.main(['fetch', 'transfo-xl-wt103']) == 0
+    *lines, rest = capsys.readouterr().err.split('\n')
+    assert rest == '' and [line.split('\r')[-1] for line in lines] == ['pytorch_model.bin: 3.0 MiB of 3.0 MiB',
+                                                                       'vocab.json: 2.0 MiB of 2.0 MiB']
+    assert all(part.startswith(file + ': ') for line, file in zip(lines, ('pytorch_model.bin', 'vocab.json'))
+               for part in line.split('\r')[1:])
+
+
+def test_progress_lines_end_before_any_later_output(hub, monkeypatch, capsys):
+    import httpx
+    import sys
+    from wsbench import cli
+
+    monkeypatch.setattr(sys.stderr, 'isatty', lambda: True)
+    stand_in = hub('transfo-xl-wt103', sizes=SIZES)
+    data = stand_in.files['pytorch_model.bin']
+
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            yield from (data[start:start + 40_000] for start in range(0, 2 * 2**20 + 1, 40_000))
+            raise httpx.ReadError('connection lost')
+
+    stand_in.serve['pytorch_model.bin'] = lambda request: httpx.Response(
+        200, headers={'content-length': str(len(data))}, stream=Broken())
+    assert cli.main(['fetch', 'transfo-xl-wt103']) == 1
+    assert capsys.readouterr().err == ('\rpytorch_model.bin: 1.0 MiB of 3.0 MiB\rpytorch_model.bin: 2.0 MiB of 3.0 MiB'
+                                       '\nE_DOWNLOAD connection lost; run: wsbench fetch transfo-xl-wt103\n')
+
+    def interrupted(name, progress=None):
+        progress('pytorch_model.bin', 2 * 2**20, 4 * 2**20)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fetch, 'fetch', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(['fetch', 'transfo-xl-wt103'])
+    assert capsys.readouterr().err == '\rpytorch_model.bin: 2.0 MiB of 4.0 MiB\n'      # before the traceback
+
+    cli._progress('a.bin', 2 * 2**20, None)                     # another caller: the next file ends an open line
+    cli._progress('b.bin', 2**20, 2 * 2**20)
+    cli._end_progress()
+    cli._end_progress()
+    assert capsys.readouterr().err == '\ra.bin: 2.0 MiB\n\rb.bin: 1.0 MiB of 2.0 MiB\n'
+
+
+def test_a_second_fetch_of_the_same_model_waits_for_the_first(wt103_hub):
+    """Two fetches of one model at once (two `wsbench fetch` processes) would write the same partial files. The second
+    waits until the first is done, then finds every file present and downloads nothing."""
+    import httpx
+
+    hub = wt103_hub
+    data = hub.files['pytorch_model.bin']
+    inside, release = threading.Event(), threading.Event()
+
+    class Held(httpx.SyncByteStream):                           # the first fetch stops halfway through the weights
+        def __iter__(self):
+            yield data[:len(data) // 2]
+            inside.set()
+            release.wait(10)
+            yield data[len(data) // 2:]
+
+    hub.serve['pytorch_model.bin'] = lambda request: httpx.Response(
+        200, headers={'content-length': str(len(data))}, stream=Held())
+    errors = []
+
+    def run():
+        try:
+            fetch.fetch(hub.name)
+        except Exception as exc:                                # noqa: BLE001 (reported below)
+            errors.append(exc)
+
+    first, second = threading.Thread(target=run, daemon=True), threading.Thread(target=run, daemon=True)
+    first.start()
+    assert inside.wait(10)
+    second.start()
+    try:
+        second.join(0.5)
+        assert second.is_alive() and hub.requests == ['config.json', 'pytorch_model.bin']
+    finally:
+        release.set()
+        first.join(10)
+        second.join(10)
+    assert errors == [] and not first.is_alive() and not second.is_alive()
+    assert hub.requests == ['config.json', 'pytorch_model.bin', 'vocab.json']        # nothing by the second fetch
+    assert sorted(p.name for p in hub.directory.iterdir()) == sorted(hub.files)
+    fetch.verify(hub.name)
+
+
+def test_fetch_removes_a_partial_file_when_the_file_is_already_there(wt103_hub):
+    """A fetch killed during a file leaves its partial file. When the file is then put in place by other means (a
+    copy), the next fetch finds it with the right hash and removes the partial file too."""
+    hub = wt103_hub
+    hub.directory.mkdir(parents=True)
+    for file, data in hub.files.items():
+        (hub.directory / file).write_bytes(data)
+        fetch.partial_path(hub.directory, file).write_bytes(b'left by a fetch killed with SIGKILL')
+    fetch.fetch(hub.name)
+    assert hub.requests == []
+    assert sorted(p.name for p in hub.directory.iterdir()) == sorted(hub.files)
+
+
+def test_a_corrupt_file_in_a_read_only_directory_is_still_E_DOWNLOAD(wt103_hub, monkeypatch):
+    """In a read-only model directory the file with the wrong hash cannot be deleted. A statement and fetch() still
+    report E_DOWNLOAD and name the file, instead of an OSError (E_RUNTIME)."""
+    hub = wt103_hub
+    hub.directory.mkdir(parents=True)
+    for file, data in hub.files.items():
+        (hub.directory / file).write_bytes(data)
+    (hub.directory / 'config.json').write_bytes(b'corrupt')
+    unlink = Path.unlink
+
+    def read_only(path, missing_ok=False):                      # unlink on a read-only mount: EROFS, even for no file
+        if path.parent == hub.directory:
+            raise OSError(errno.EROFS, 'Read-only file system', str(path))
+        unlink(path, missing_ok)
+
+    monkeypatch.setattr(Path, 'unlink', read_only)
+    message = (f"config.json: SHA-256 mismatch (cannot delete it: [Errno 30] Read-only file system: "
+               f"'{hub.directory / 'config.json'}'); run: wsbench fetch transfo-xl-wt103")
+    (verdict,) = run_script('model transfo-xl-wt103\nX1: gauge permute(L[mid].mlp, randperm)')
+    assert verdict['error'] == {'code': 'E_DOWNLOAD', 'message': message}
+    with pytest.raises(fetch.DownloadError) as info:
+        fetch.fetch(hub.name)
+    assert str(info.value) == message and hub.requests == []
+    assert (hub.directory / 'config.json').read_bytes() == b'corrupt'
+    (hub.directory / 'config.json').write_bytes(hub.files['config.json'])
+    fetch.fetch(hub.name)                       # all files right: nothing to download and nothing to delete
+    assert hub.requests == []
 
 
 # ---------------------------------------------------------------- the real checkpoint
@@ -496,3 +707,41 @@ def test_wt103_example_reproduces_the_language_card():
     swap = rows['X10']['metrics']['changed_tensors']
     assert len(swap) == 26 and {t['name'].split('.')[2] for t in swap} == {'8', '9'}
     print(f'16 transfo-xl-wt103 statements: {seconds:.1f} s')
+
+
+@pytest.mark.network
+def test_wt103_symmetry_draws_in_l1_stay_within_the_card():
+    """The card's FACTS line on transfo-xl-wt103 is no hard bound. Two seed-0 draws in L1, permuting the heads on
+    line 11 and V/O of L1.H1 on line 41, change the log-probabilities by 1.7e-13 and 2.0e-13 relative: more than the
+    'at most 1.4e-13' the card once said, within the 2e-13 it gives for single draws, and exact (at most 1e-9)."""
+    reach = float(re.search(r'where single draws reach (\d(?:\.\d+)?e-\d+);', LANGUAGE_CARD).group(1))
+    fetch.fetch('transfo-xl-wt103')
+    lines = ['model transfo-xl-wt103', 'seed 0', *['#'] * 8, 'P: gauge permute(L1.heads, randperm)', *['#'] * 29,
+             'V: gauge vo(L1.H[1], gl)']
+    rows = {v['label']: v for v in run_script('\n'.join(lines))}
+    assert (rows['P']['line'], rows['V']['line']) == (11, 41)
+    for row in rows.values():
+        assert (row['status'], row['measured']) == ('CONFIRMED', 'exact') and row['metrics']['rel'] <= reach
+    print(f"permute(L1.heads) {rows['P']['metrics']['rel']:.3e}, vo(L1.H[1]) {rows['V']['metrics']['rel']:.3e}")
+
+
+@pytest.mark.network
+def test_wt103_delete_control_ranges_match_the_notes():
+    """The control of an edit is one random direction drawn from the statement's seed and line. NOTES.md gives its
+    range over ten seeds for `edit delete(L[mid])` in two protocols: the example's X9 on line 13 with `seed 0` to
+    `seed 9`, and one script with `seed s` before each of ten statements on lines 3, 5, ..., 21."""
+    notes = (Path(__file__).parents[1] / 'NOTES.md').read_text(encoding='utf-8')
+    number = r'([+-]\d+\.\d\d)'
+    ranges = [re.search(rf'\(X9 on line 13\) it ranges from {number} to {number} \(median {number}\)', notes),
+              re.search(rf'on lines 3, 5, \.\.\., 21\) gives {number} to {number} \(median {number}\)', notes)]
+    assert None not in ranges, 'NOTES.md no longer gives both ranges'
+    fetch.fetch('transfo-xl-wt103')
+    example = [run_script('\n'.join(['model transfo-xl-wt103', f'seed {s}', *['#'] * 10, 'X9: edit delete(L[mid])']))[0]
+               for s in range(10)]
+    lines = [line for s in range(10) for line in (f'seed {s}', f'D{s}: edit delete(L[mid])')]
+    one_script = run_script('\n'.join(['model transfo-xl-wt103', *lines]))
+    assert [v['line'] for v in example] == [13] * 10 and [v['line'] for v in one_script] == list(range(3, 22, 2))
+    for found, rows in zip(ranges, (example, one_script)):
+        controls = [v['metrics']['control']['dloss'] for v in rows]
+        assert all(v['metrics']['dloss'] == pytest.approx(-0.0498, abs=5e-4) for v in rows)
+        assert found.groups() == tuple(f'{x:+.2f}' for x in (min(controls), max(controls), statistics.median(controls)))

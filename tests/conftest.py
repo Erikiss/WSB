@@ -9,9 +9,10 @@ import pytest
 def hub(monkeypatch, tmp_path):
     """An offline stand-in for the Hugging Face hub, for fetch() in WSB_HOME = tmp_path.
 
-    hub(name) serves stand-in files for the snapshot `name` and pins their hashes in place of the real ones. It
-    returns a namespace: name, directory (the model directory), files (file name -> the stand-in bytes), serve (what
-    the hub answers: file name -> bytes, or a callable request -> httpx.Response) and requests (requested file names).
+    hub(name) serves stand-in files for the snapshot `name` and pins their hashes in place of the real ones; with
+    sizes (file name -> bytes) the stand-ins have those sizes instead of about 150 kB. It returns a namespace: name,
+    directory (the model directory), files (file name -> the stand-in bytes), serve (what the hub answers: file name
+    -> bytes, or a callable request -> httpx.Response) and requests (requested file names).
     """
     import httpx
     from wsbench.models import fetch
@@ -40,8 +41,12 @@ def hub(monkeypatch, tmp_path):
     real_client = httpx.Client
     monkeypatch.setattr(httpx, 'Client', lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
 
-    def stand_in(name):
-        files = {file: f'stand-in for {file} of {name} '.encode() * 3000 for file in fetch.SNAPSHOTS[name].sha256}
+    def stand_in(name, sizes=None):
+        def data(file):
+            text = f'stand-in for {file} of {name} '.encode()
+            return text * 3000 if sizes is None else (text * (sizes[file] // len(text) + 1))[:sizes[file]]
+
+        files = {file: data(file) for file in fetch.SNAPSHOTS[name].sha256}
         digests = {file: hashlib.sha256(data).hexdigest() for file, data in files.items()}
         monkeypatch.setitem(fetch.SNAPSHOTS, name, replace(fetch.SNAPSHOTS[name], sha256=digests))
         serve.clear()

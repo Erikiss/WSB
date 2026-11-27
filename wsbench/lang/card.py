@@ -65,9 +65,9 @@ FACTS MEASURED ON THESE MODELS (float64; exact = relative logit change about 1e-
   Transformer-XL exact: MLP neuron permutation and positive per-neuron rescaling (ReLU); head permutation; V/O and
           Q/K change of basis per head; L[i] := align(L[i] -> L[j]). Not exact: rotating MLP neurons; neg(L).
   transfo-xl-wt103 (122 WikiText-103 tokens, base loss 4.7249; L[mid] = L9 of 18): exact symmetries change the
-          log-probabilities by at most 1.4e-13 relative (largest in L0 and L1, about 1e-15 in L9). Edits: delete L9
-          -0.05; swap L8,L9 +3.53; L10 := -L8 (writers negated) +4.58 (delete L10 alone -0.01, delete L8 and L10
-          +0.70); L9 := mean(L8, L10) +0.94; rotate the L9 MLP +4.73.
+          log-probabilities by about 1e-13 relative or less (largest in L0 and L1, where single draws reach 2e-13;
+          about 1e-15 in L9). Edits: delete L9 -0.05; swap L8,L9 +3.53; L10 := -L8 (writers negated) +4.58 (delete
+          L10 alone -0.01, delete L8 and L10 +0.70); L9 := mean(L8, L10) +0.94; rotate the L9 MLP +4.73.
   modadd (p=97, 50 % train): memorised by step ~150, generalises (test >= 0.9) by step ~1200; Grokfast ~1.2x earlier;
           the straight line memorised -> grokked has a barrier (train acc ~0.8 at t=0.25); the direction of one seed
           is orthogonal to another seed's (cosine ~0) and transplanting it destroys the other model."""

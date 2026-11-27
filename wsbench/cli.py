@@ -19,12 +19,39 @@ def _line(verdict):
     return row
 
 
+_open_line = None      # the file whose progress line is on the terminal and not ended yet
+
+
+def _stderr(text=""):
+    """Print a line to stderr. When that fails (EIO once the terminal has hung up, under a disowned job), the line is
+    dropped: what the command did must not depend on it."""
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def _end_progress():
+    """End the open progress line, so that the next output starts on a line of its own."""
+    global _open_line
+    if _open_line is not None:
+        _open_line = None
+        _stderr()
+
+
 def _progress(file, received, total):
-    """One progress line per downloaded file of at least 1 MiB, rewritten in place (only on a terminal)."""
-    if total is not None and total < 2**20:
+    """One progress line per downloaded file of at least 1 MiB, rewritten in place (only on a terminal). The line ends
+    with its file (fetch() reports the end of each file once, with total = received when the size was unknown) or
+    before any later output. An OSError (the terminal hung up) goes to fetch(), which then stops calling this."""
+    global _open_line
+    if (received if total is None else total) < 2**20:
         return
-    text = f"{file}: {received / 2**20:.1f} MiB" + (f" of {total / 2**20:.1f} MiB" if total else "")
-    print("\r" + text, end="\n" if total and received >= total else "", file=sys.stderr, flush=True)
+    if _open_line != file:
+        _end_progress()
+    text = f"{file}: {received / 2**20:.1f} MiB" + (f" of {total / 2**20:.1f} MiB" if total is not None else "")
+    done = total is not None and received >= total
+    print("\r" + text, end="\n" if done else "", file=sys.stderr, flush=True)
+    _open_line = None if done else file
 
 
 def main(argv=None):
@@ -60,8 +87,11 @@ def main(argv=None):
                 fetch_arc()
             return 0
         except Exception as exc:
-            print(f"E_DOWNLOAD {exc}", file=sys.stderr)
+            _end_progress()
+            _stderr(f"E_DOWNLOAD {exc}")
             return 1
+        finally:
+            _end_progress()                 # also before the traceback of an interrupt
     try:
         script = args.file.read_text(encoding="utf-8")
         if args.command == "check":

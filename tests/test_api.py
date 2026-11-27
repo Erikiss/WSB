@@ -1111,3 +1111,32 @@ process.stdout.write(JSON.stringify(out));
         assert len(statements) == len(matrices[model])
         parsed, errors = parse(f"model {model}\n" + "\n".join(statements))
         assert errors == validate(parsed) == [], model
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="runs heatmap() of app.js in node")
+def test_tensor_panel_stretches_flat_tensors_so_each_row_shows():
+    """A heatmap canvas is as wide as the panel, and object-fit: contain scales it by that width, so a tensor much
+    wider than tall (a 1-D bias, crit.cluster_weight [3 x 1024]) became a sliver of 1 to 3 px. Tensors at least 8 times
+    wider than tall are stretched (fill) to at least 8 px per row; square and tall matrices keep contain."""
+    source = (Path(__file__).parents[1] / "wsbench" / "server" / "static" / "app.js").read_text(encoding="utf-8")
+    functions = [re.search(rf"^function {name}\(.*?^}}$", source, re.M | re.S).group(0)
+                 for name in ("canvas", "heatmap")]
+    program = "\n".join(functions) + """
+const context = {createImageData: (w, h) => ({data: new Uint8ClampedArray(4 * w * h)}), putImageData() {}};
+const el = (tag, className) => ({tag, className, style: {}, setAttribute() {}, getContext: () => context});
+const sizes = {bias: [1, 256], cluster_weight: [3, 256], wide: [32, 256], block: [64, 512], square: [256, 256],
+               tall: [256, 32], almost_flat: [33, 256]};
+const out = {};
+for (const [name, [h, w]] of Object.entries(sizes)) {
+  const node = heatmap(Array.from({length: h}, () => new Array(w).fill(0.5)), 1, name);
+  out[name] = [node.width, node.height, node.style.objectFit || "contain (style.css)", node.style.minHeight || ""];
+}
+process.stdout.write(JSON.stringify(out));
+"""
+    out = json_loads(subprocess.run(["node", "-e", program], capture_output=True, text=True, check=True).stdout)
+    assert out == {
+        "bias": [256, 1, "fill", "14px"], "cluster_weight": [256, 3, "fill", "24px"],
+        "wide": [256, 32, "fill", "256px"], "block": [512, 64, "fill", "360px"],
+        "square": [256, 256, "contain (style.css)", ""],
+        "tall": [32, 256, "contain (style.css)", ""], "almost_flat": [256, 33, "contain (style.css)", ""],
+    }

@@ -1,10 +1,17 @@
 """Fetch the pinned model snapshots and check each file before use."""
 import hashlib
+import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from wsbench.paths import home
+
+try:
+    import fcntl
+except ImportError:          # Windows: fetch() takes no lock
+    fcntl = None
 
 
 @dataclass(frozen=True)
@@ -59,12 +66,27 @@ def local(name):
     return all((model_dir(name) / file).is_file() for file in _snapshot(name).sha256)
 
 
-def _check(path: Path, expected: str, name: str = 'pythia-14m'):
+def _sha256(path: Path):
     with path.open('rb') as fp:
-        digest = hashlib.file_digest(fp, 'sha256').hexdigest()
-    if digest != expected:
+        return hashlib.file_digest(fp, 'sha256').hexdigest()
+
+
+def _delete(path: Path, file: str, name: str):
+    """Delete a file with the wrong hash. If that fails (a read-only model directory), the error is still E_DOWNLOAD
+    and names the file."""
+    try:
         path.unlink(missing_ok=True)
-        raise DownloadError(f'SHA-256 mismatch; run: wsbench fetch {name}')
+    except OSError as exc:
+        raise DownloadError(f'{file}: SHA-256 mismatch (cannot delete it: {exc}); run: wsbench fetch {name}') from exc
+
+
+def _check(path: Path, expected: str, name: str = 'pythia-14m', file: str | None = None):
+    """Raise DownloadError if `path` does not have the pinned hash, after deleting it. The message names `file`, the
+    snapshot file (by default the name of `path`)."""
+    if _sha256(path) != expected:
+        file = file or path.name
+        _delete(path, file, name)
+        raise DownloadError(f'{file}: SHA-256 mismatch; run: wsbench fetch {name}')
 
 
 def verify(name, directory=None):
@@ -80,7 +102,8 @@ def verify(name, directory=None):
 
 def partial_path(directory, file):
     """The download of `file` in progress. The name is fixed, so a fetch that was killed (SIGKILL, SIGHUP, SIGTERM)
-    leaves at most one partial file per snapshot file, and the next fetch overwrites and then removes it."""
+    leaves at most one partial file per snapshot file. The next fetch overwrites and then removes it, or only removes
+    it when the file is already there with the right hash."""
     return Path(directory) / f'.{file}.part'
 
 
@@ -88,30 +111,65 @@ def partial_path(directory, file):
 _LEGACY_TMP = re.compile(r'tmp[a-z0-9_]{8}')
 
 
+@contextmanager
+def _locked(directory: Path):
+    """One fetch per model directory at a time, also across processes: an exclusive flock on the directory, as in
+    exec/runs.py. The kernel drops it when the process ends, also on SIGKILL. Without fcntl there is no lock."""
+    if fcntl is None:
+        yield
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _discard(path: Path):
+    """Remove a leftover of a killed fetch. One that cannot be removed (a read-only directory) is harmless and stays."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def fetch(name, progress=None):
     """Download the missing files of the snapshot and check the ones that are already there; a file with the wrong
     hash is deleted and downloaded again. Each download goes to partial_path(directory, file) and is renamed after
-    its hash check. progress(file, received_bytes, total_bytes or None) is called after each received chunk."""
+    its hash check. A second fetch of the same snapshot waits for the first and then finds its files present.
+
+    progress(file, received_bytes, total_bytes or None) is called after each received chunk and at the end of each
+    file. Only the call at the end can have received_bytes = total_bytes; when the server sent no size, total_bytes is
+    then the size received. A callback that raises OSError (EIO once the terminal has hung up) is not called again,
+    and the download goes on."""
     import httpx
 
     snapshot = _snapshot(name)
     directory = model_dir(name)
     file = None
+
+    def report(*args):
+        nonlocal progress
+        if progress is not None:
+            try:
+                progress(*args)
+            except OSError:
+                progress = None
+
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        for path in directory.iterdir():
-            if _LEGACY_TMP.fullmatch(path.name) and path.is_file():
-                path.unlink(missing_ok=True)
-        with httpx.Client(follow_redirects=True, timeout=90) as client:
+        with _locked(directory), httpx.Client(follow_redirects=True, timeout=90) as client:
+            for path in directory.iterdir():
+                if _LEGACY_TMP.fullmatch(path.name) and path.is_file():
+                    _discard(path)
             for file, expected in snapshot.sha256.items():
-                dest = directory / file
+                dest, part = directory / file, partial_path(directory, file)
                 if dest.is_file():
-                    try:
-                        _check(dest, expected, name)
+                    if _sha256(dest) == expected:
+                        _discard(part)                  # left by an earlier fetch that was killed
                         continue
-                    except DownloadError:
-                        pass                    # _check deleted the corrupt file: download it again
-                part = partial_path(directory, file)
+                    _delete(dest, file, name)           # the wrong hash: download it again
                 try:
                     with client.stream('GET', f'{snapshot.base_url}/{file}') as response:
                         response.raise_for_status()
@@ -120,9 +178,12 @@ def fetch(name, progress=None):
                         with part.open('wb') as fp:
                             for chunk in response.iter_bytes(1024 * 1024):
                                 fp.write(chunk)
-                                if progress is not None:
-                                    progress(file, response.num_bytes_downloaded, total)
-                    _check(part, expected, name)
+                                # The byte count can reach the total before the last chunk: the end comes below
+                                if total is None or response.num_bytes_downloaded < total:
+                                    report(file, response.num_bytes_downloaded, total)
+                        received = response.num_bytes_downloaded
+                        report(file, received, received if total is None else total)
+                    _check(part, expected, name, file)
                     part.replace(dest)
                 finally:
                     part.unlink(missing_ok=True)

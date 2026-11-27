@@ -21,7 +21,8 @@ def test_corrupt_model_fails_before_use(hub):
         (directory / name).write_bytes(b'corrupt')
     first, second = run_script('model pythia-14m\ngauge fold_ln()\ngauge fold_ln()')
     assert first['status'] == second['status'] == 'ERROR'
-    assert first['error'] == {'code': 'E_DOWNLOAD', 'message': 'SHA-256 mismatch; run: wsbench fetch pythia-14m'}
+    assert first['error'] == {'code': 'E_DOWNLOAD',
+                              'message': 'config.json: SHA-256 mismatch; run: wsbench fetch pythia-14m'}
     assert not (directory / 'config.json').exists()                 # deleted before anything read it
     assert second['error'] == {'code': 'E_DOWNLOAD', 'message': 'run: wsbench fetch pythia-14m'}
     fetch.fetch_pythia()               # downloads the deleted file and, after their hash checks, the corrupt ones
