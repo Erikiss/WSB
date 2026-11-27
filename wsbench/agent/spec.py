@@ -42,7 +42,7 @@ TOOLS = [
     {
         "type": "custom",
         "name": "wsl_run",
-        "description": "Execute a WSL script on real weights and return one measured verdict per statement: status, measured class, delta-loss, relative logit change, control ratio, or passed/total for grid tasks. Deterministic. neox and grid statements take seconds; each train statement takes minutes.",
+        "description": "Execute a WSL script on real weights and return one measured verdict per statement: status, measured class, delta-loss, relative logit change, control ratio, or passed/total for grid tasks. Deterministic. neox, txl and grid statements take seconds; each train statement takes minutes.",
         "input_schema": {
             "type": "object",
             "properties": {"script": {"type": "string", "description": "The complete WSL script, starting with a model directive."}},

@@ -32,7 +32,8 @@ def main(argv=None):
     check.add_argument("file", type=Path)
     fetch = commands.add_parser("fetch", help="download a pinned model or the ARC corpus "
                                 "(all = pythia-14m and arc; the 1.1 GB transfo-xl-wt103 only by name)")
-    fetch.add_argument("what", choices=["pythia-14m", "transfo-xl-wt103", "arc", "all"])
+    fetch.add_argument("what", choices=["pythia-14m", "transfo-xl-wt103", "arc", "all"],
+                       help="all = pythia-14m and arc; transfo-xl-wt103 (1.1 GB) is fetched only by name")
     args = parser.parse_args(argv)
     if args.command == "serve":
         import uvicorn

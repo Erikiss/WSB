@@ -87,7 +87,7 @@
           <div class="form-body">
             <label class="sr-only" for="abstract">Paste a paper abstract or describe an idea</label>
             <textarea id="abstract" required rows="8" placeholder="Paste a paper abstract or describe an idea"></textarea>
-            <label class="field" for="target">Target model<select id="target"><option>pythia-14m</option><option>neox-tiny</option></select></label>
+            <label class="field" for="target">Target model<select id="target"><option>pythia-14m</option><option>neox-tiny</option><option>transfo-xl-wt103</option><option>txl-tiny</option></select></label>
             <div class="rule"></div>
             <h3>Model roles</h3>
             <div id="role-fields" class="fields"></div>
@@ -109,7 +109,7 @@
           <div class="form-body">
             <label class="sr-only" for="idea">Describe an idea, in any language</label>
             <textarea id="idea" required rows="8" placeholder="Describe an idea, in any language. A planner model turns it into a series of measured experiments."></textarea>
-            <label class="field" for="explore-target">Target model<select id="explore-target"><option>pythia-14m</option><option>neox-tiny</option></select></label>
+            <label class="field" for="explore-target">Target model<select id="explore-target"><option>pythia-14m</option><option>neox-tiny</option><option>transfo-xl-wt103</option><option>txl-tiny</option></select></label>
             <div class="fields">
               <label class="field" for="explore-rounds">Rounds (1–8)<input id="explore-rounds" type="number" min="1" max="8" step="1" value="3" required></label>
               <label class="field" for="explore-budget">Budget in USD<input id="explore-budget" type="number" min="0.1" max="5" step="0.1" value="1" required></label>
@@ -152,6 +152,7 @@
       <div class="panel"><div class="panel-heading"><h2>Licences and attribution</h2></div><dl class="credits">
         <dt>WSBench code</dt><dd>MIT</dd>
         <dt>pythia-14m</dt><dd>Apache-2.0 · EleutherAI</dd>
+        <dt>transfo-xl-wt103</dt><dd>No licence stated on the Hugging Face model card (transfo-xl/transfo-xl-wt103) · 1.1 GB, 285.2M parameters, fetched with <code>wsbench fetch transfo-xl-wt103</code>. Original code kimiyoung/transformer-xl: Apache-2.0. Trained on WikiText-103: CC BY-SA.</dd>
         <dt>Code Golf 2025 tasks and solutions</dt><dd>Apache-2.0 · SakanaAI/google-code-golf-2025. Includes ARC-AGI-1 data (Apache-2.0, F. Chollet) and ARC-GEN examples (Apache-2.0, Google).</dd>
         <dt>Grid-primitive semantics</dt><dd>MIT · michaelhodel/arc-dsl. Reimplemented for WSBench.</dd>
         <dt>ARC palette</dt><dd>Apache-2.0 · Google Code Golf 2025 utilities</dd>

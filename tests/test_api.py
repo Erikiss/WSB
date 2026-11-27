@@ -68,8 +68,9 @@ def assert_error(response, status, code):
 def test_health(client):
     response = client.get("/api/health")
     assert response.status_code == 200
-    assert response.json() == {"version": "0.1.0", "ok": True, "llm": "mock",
-                               "arc_local": True, "models_local": {"pythia-14m": False}, "anthropic": False, "agent": True}
+    assert response.json() == {"version": "0.1.0", "ok": True, "llm": "mock", "arc_local": True,
+                               "models_local": {"pythia-14m": False, "transfo-xl-wt103": False},
+                               "anthropic": False, "agent": True}
 
 
 def test_page_language_examples_palette(client):
@@ -81,15 +82,17 @@ def test_page_language_examples_palette(client):
     data = client.get("/api/language").json()
     assert set(data) == {"card", "ops", "examples"}
     assert data["card"] == LANGUAGE_CARD
-    names = ["rotate_middle_layer", "antisymmetric_pair", "grokking_steerable", "arc_mirror"]
+    names = ["rotate_middle_layer", "antisymmetric_pair", "grokking_steerable", "arc_mirror", "transformer_xl"]
     assert [e["name"] for e in data["examples"]] == [n + ".wsl" for n in names]
     for entry in data["examples"]:
         assert client.post("/api/parse", json={"script": entry["script"]}).json()["errors"] == []
     ops = data["ops"]
-    assert [op["family"] for op in ops] == ["neox"] * 16 + ["modadd"] * 7 + ["grid"] * 4
+    assert [op["family"] for op in ops] == ["neox"] * 16 + ["txl"] * 10 + ["modadd"] * 7 + ["grid"] * 4
     assert all(set(op) == {"family", "call", "args", "doc"} for op in ops)
     assert ops[0] == {"family": "neox", "call": "fold_ln()", "args": "", "doc": "reparam (adds embed_out.bias)"}
-    assert ops[16]["doc"].startswith("Only valid with claim")
+    assert ops[26]["doc"].startswith("Only valid with claim")
+    txl_calls = [op["call"] for op in ops if op["family"] == "txl"]
+    assert "qk(L[i].H[h], A, dims=all)" in txl_calls and not any(c.startswith(("fold_ln", "rope_pairs")) for c in txl_calls)
     assert ops[-1]["call"] == "golf()"
 
 
@@ -276,6 +279,97 @@ def test_queued_and_running_cancellation(client, monkeypatch):
     assert completed["verdicts"][0]["status"] == "MEASURED"
     params = {"run_id": first, "line": 2, "name": "gpt_neox.embed_in.weight", "which": "after"}
     assert client.get("/api/tensor", params=params).status_code == 200
+
+
+def test_txl_parse_reports_families_reasons_and_hints(client):
+    script = """model transfo-xl-wt103
+A: gauge permute(L[mid].heads, randperm)
+B: gauge rotate(L[mid].mlp, orth)
+C: gauge fold_ln(); rotate(resid, orth1)
+model txl-tiny
+D: edit L[mid] := lerp(L1, L3, 0.5)
+E: gauge qk(L0.H0, gl, dims=pass)
+"""
+    parsed = client.post("/api/parse", json={"script": script}).json()
+    assert [(s["label"], s["family"]) for s in parsed["statements"]] == [
+        ("A", "txl"), ("B", "txl"), ("C", "txl"), ("D", "txl"), ("E", "txl")]
+    assert parsed["statements"][0]["source"] == "gauge permute(L[mid].heads, randperm)"
+    assert [(e["line"], e["code"], e["message"]) for e in parsed["errors"]] == [
+        (4, "E_MODEL", "fold_ln is not defined for post-LayerNorm Transformer-XL"),
+        (7, "E_MODEL", "qk(..., dims=pass) is not defined for Transformer-XL: it has no rotary dimensions; use dims=all")]
+    assert [(h["line"], h["code"]) for h in parsed["hints"]] == [(3, "H_RELU_ROTATE"), (6, "H_LERP_ALIGN")]
+
+
+def test_txl_run_through_the_queue_and_its_tensor_views(client):
+    script = "model txl-tiny\nG: gauge vo(L1.H0, gl)\nD: edit delete(L[mid])\nS: edit swap(L0, L3)\nT: gauge fold_ln()"
+    run_id = submit(client, script)
+    job = finish(client, run_id)
+    rows = job["verdicts"]
+    assert [(v["label"], v["status"], v["measured"]) for v in rows] == [
+        ("G", "CONFIRMED", "exact"), ("D", "MEASURED", "edit"), ("S", "MEASURED", "edit"), ("T", "ERROR", None)]
+    assert all(v["model"] == "txl-tiny" for v in rows) and rows[3]["error"]["code"] == "E_MODEL"
+    deleted = rows[1]["metrics"]
+    assert deleted["rel"] > 1e-3 and deleted["control"]["ratio"] is not None
+    assert {t["name"] for t in deleted["changed_tensors"]} == {
+        "transformer.layers.2.dec_attn.o_net.weight", "transformer.layers.2.pos_ff.CoreNet.3.weight",
+        "transformer.layers.2.pos_ff.CoreNet.3.bias"}
+
+    def tensor(line, name, which, **kwargs):
+        return client.get("/api/tensor", params={"run_id": run_id, "line": line, "name": name, "which": which, **kwargs})
+
+    from wsbench.models.registry import load_model
+    W0 = load_model("txl-tiny").W0
+    name = "transformer.layers.2.pos_ff.CoreNet.3.weight"
+    before, after, diff = (tensor(3, name, which).json() for which in ("before", "after", "diff"))
+    assert before["shape"] == before["shown"] == [16, 64] and before["block"] == [1, 1]
+    np.testing.assert_allclose(before["data"], W0[name].numpy(), rtol=1e-5)
+    assert after["data"] == [[0] * 64] * 16
+    np.testing.assert_allclose(diff["data"], -W0[name].numpy(), rtol=1e-5)
+    bias = tensor(3, "transformer.layers.2.pos_ff.CoreNet.3.bias", "after").json()
+    assert bias["shape"] == [16] and bias["shown"] == [1, 16] and bias["data"] == [[0] * 16]
+    untouched = tensor(3, "transformer.word_emb.emb_layers.0.weight", "diff").json()
+    assert untouched["shape"] == [16, 16] and untouched["data"] == [[0] * 16] * 16
+    arc = tensor(3, name, "before", view="arc", r0=0, r1=4, c0=0, c1=6).json()
+    assert np.shape(arc["grid"]) == (4, 6) and len(arc["quantiles"]) == 9
+    # the swap stored the baseline's own tensors: after(L0) is before(L3)
+    swapped = tensor(4, "transformer.layers.0.dec_attn.qkv_net.weight", "after").json()
+    assert swapped["data"] == tensor(4, "transformer.layers.3.dec_attn.qkv_net.weight", "before").json()["data"]
+    assert_error(tensor(3, "crit.out_layers.0.weight", "after"), 404, "E_NOT_FOUND")     # tied: not a separate tensor
+    assert_error(tensor(5, name, "after"), 404, "E_NOT_FOUND")                           # an invalid line has no state
+
+
+def test_assist_and_explore_accept_txl_targets(client):
+    data = client.post("/api/assist", json={"text": "rotation idea", "model": "txl-tiny"}).json()
+    assert data["script"] == "model txl-tiny" and data["run_id"] is None        # the mock translator writes NeoX ops
+    assert {e["message"] for e in data["parse_errors"] if e["code"] == "E_MODEL"} >= {
+        "fold_ln is not defined for post-LayerNorm Transformer-XL"}
+    for model in ("txl-tiny", "transfo-xl-wt103"):
+        assert client.post("/api/assist/start", json={"text": "x", "model": model, "execute": False}).status_code == 200
+    explore_id = client.post("/api/explore/start", json={"text": "idea", "model": "transfo-xl-wt103", "rounds": 1}).json()
+    assert set(explore_id) == {"explore_id"}
+    assert _wait_explore(client, explore_id["explore_id"])["status"] == "done"
+
+
+def test_tensor_states_stay_within_the_memory_budget(client, monkeypatch):
+    from wsbench.exec import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "STATE_BYTES", 25_000)        # two txl-tiny deletes (10,368 bytes each) fit
+    name = "transformer.layers.{}.pos_ff.CoreNet.3.weight"
+
+    def view(run_id, line, layer):
+        return client.get("/api/tensor", params={"run_id": run_id, "line": line, "name": name.format(layer), "which": "after"})
+
+    first = submit(client, "model txl-tiny\nedit delete(L0)")
+    finish(client, first)
+    assert view(first, 2, 0).status_code == 200
+    second = submit(client, "model txl-tiny\nedit delete(L1)\nedit delete(L2)")
+    finish(client, second)
+    assert assert_error(view(first, 2, 0), 410, "E_EXPIRED")["message"] == "state expired; re-run the script"
+    assert view(second, 2, 1).status_code == view(second, 3, 2).status_code == 200
+    third = submit(client, "model txl-tiny\nedit delete(L0)\nedit delete(L1)\nedit delete(L2)")
+    finish(client, third)
+    assert_error(view(second, 2, 1), 410, "E_EXPIRED")             # older runs go first
+    assert_error(view(third, 2, 0), 410, "E_EXPIRED")              # then the earliest lines of the run itself
+    assert view(third, 3, 1).status_code == view(third, 4, 2).status_code == 200
 
 
 def test_tensor_and_run_retention_boundaries(client):

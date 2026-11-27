@@ -23,7 +23,7 @@ from wsbench.lang.hints import hints
 from wsbench.lang.parser import parse
 from wsbench.lang.printer import print_statement
 from wsbench.lang.validate import validate
-from wsbench.models.fetch import pythia_local
+from wsbench.models.fetch import local, pythia_local
 from ._catalog import OPS
 
 app = FastAPI(title="WSBench", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
@@ -66,12 +66,13 @@ def health():
         llm = "live"
     return {"ok": True, "version": __version__, "llm": llm, "anthropic": anthropic_api.available(),
             "agent": agent_sessions_available(),
-            "models_local": {"pythia-14m": pythia_local()}, "arc_local": arc_local()}
+            "models_local": {"pythia-14m": pythia_local(), "transfo-xl-wt103": local("transfo-xl-wt103")},
+            "arc_local": arc_local()}
 
 
 @app.get("/api/language")
 def language():
-    names = ("rotate_middle_layer", "antisymmetric_pair", "grokking_steerable", "arc_mirror")
+    names = ("rotate_middle_layer", "antisymmetric_pair", "grokking_steerable", "arc_mirror", "transformer_xl")
     return {"card": LANGUAGE_CARD, "ops": OPS,
             "examples": [{"name": name + ".wsl", "script": (EXAMPLES / (name + ".wsl")).read_text("utf-8")}
                          for name in names]}

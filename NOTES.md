@@ -11,7 +11,7 @@ wsbench fetch all
 wsbench serve
 ```
 
-Open `http://127.0.0.1:8765/` on the same computer. The tiny model works on a fresh offline installation. The default data directory is `~/.cache/wsbench`. Set `WSB_HOME` to choose another directory.
+`wsbench fetch transfo-xl-wt103` adds the 1.1 GB Transformer-XL checkpoint; `all` leaves it out. Open `http://127.0.0.1:8765/` on the same computer. The tiny models work on a fresh offline installation. The default data directory is `~/.cache/wsbench`. Set `WSB_HOME` to choose another directory.
 
 ```sh
 wsbench check tests/data/tiny_battery.wsl
@@ -28,10 +28,10 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 - Each synchronous progress callback receives a snapshot that remains valid as subsequent statements run.
 - Numeric overflow produces a diagnostic for the affected statement so a run remains JSON-serializable.
 - The two-column grid catalogue supplies the descriptions for the Language tab and leaves its arguments column empty.
-- The executor retains changed tensors for the five most recently submitted scripts, counting queued and cancelled scripts.
+- The executor retains changed tensors for the five most recently submitted scripts, counting queued and cancelled scripts, and for at most 2 GiB in all (`jobs.STATE_BYTES`, counting each kept tensor once per line, also one shared with the baseline): the states of the oldest runs are dropped first, then the earliest lines of the running script. A dropped state answers 410 `E_EXPIRED`.
 - The assist uses OpenRouter's reported cost when available and the dossier prices for known models. A custom model without either source of pricing contributes zero to the estimate.
 - Code Golf fixture subsets use the upstream Apache-2.0 licence in `tests/fixtures/golf_mini/LICENSE`.
-- NeoX uses one torch thread for the tiny model and two for Pythia and restores the caller's thread count afterward.
+- NeoX uses one torch thread for the tiny model and two for Pythia, Transformer-XL one for `txl-tiny` and up to four for `transfo-xl-wt103`; the caller's thread count is restored afterward.
 
 ## Run history
 
@@ -80,13 +80,49 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 
 ## Transformer-XL
 
-- Two weight models of the family `txl` (`wsbench/models/txl.py`): `transfo-xl-wt103`, the Hugging Face checkpoint `transfo-xl/transfo-xl-wt103` at revision `40a186da79458c9f9de846edfaea79c412137f97` (Transformer-XL large on WikiText-103: 18 layers, d 1024, 16 heads, adaptive embedding and softmax with four clusters), and `txl-tiny` (random weights, offline). `wsbench fetch transfo-xl-wt103` downloads `config.json`, `pytorch_model.bin` (1.1 GB) and `vocab.json`; `fetch all` leaves it out. The pickled vocabulary files of the repository are never fetched, and the weights are read with `torch.load(weights_only=True)` after the SHA-256 check.
-- The checkpoint has 285,205,322 parameters (322,473,146 if the tied embedding and softmax tensors are counted twice). No public Transformer-XL checkpoint has 551M parameters. The geometry is read from `config.json`, so another Transformer-XL checkpoint needs a snapshot entry in `fetch.py` and a `SHAPES` entry, no new code (configurations with `div_val` 1, pre-LayerNorm or shared position biases are refused).
-- A model state holds each tensor once: the softmax weights and the tied projections are stored under their `transformer.word_emb.*` names. Operators are copy-on-write: they share every tensor they leave alone.
-- WSBench measures one segment without memory (the plain causal mask, as on the first segment of the original evaluation). Hugging Face's TransfoXL called without `mems` prepends 1600 all-zero memory slots to every layer instead. They act as an attention sink and lower the probe loss from 4.7249 to 4.1357 nats. `txl.forward(..., zero_mems=1600)` reproduces that call.
-- The positional frequencies are the checkpoint's float32 table (`transformer.pos_emb.inv_freq`, at most 8.2e-8 relative from the float64 formula). The formula in float64 would move the probe log-probabilities by up to 6.4e-6.
-- Agreement with transformers 4.46.3 in float64: `txl-tiny` within 1.1e-14 in every log-probability (without memory, with zero memories, a batch of two, `same_length` off, other clamp and window lengths). On the 122-token WikiText-103 probe the largest log-probability difference is 3.9e-12; the loss is 4.724939573022554 against 4.724939573022569, and 4.135668769365871 against 4.135668769365872 with zero memories. The references are in `tests/data/txl_tiny_reference.json` and `tests/data/txl_wt103_probe.json`.
-- On four CPU threads `transfo-xl-wt103` loads in 4.0 s (hash checks 1.3 s) and one forward pass takes 0.9 to 1.2 s. The float64 state needs 2.12 GiB; the process peaks at 3.0 GiB after loading. An exact symmetry measured at full size changes the log-probabilities by at most 9.1e-14 relative.
+The owner asked for Transformer-XL with 551M parameters. No public Transformer-XL checkpoint has that size, so WSBench uses the public Transformer-XL large model on WikiText-103 and reads its geometry from `config.json`. Another Transformer-XL checkpoint needs a snapshot entry in `fetch.py` and a `SHAPES` entry in `registry.py`, not new code. Configurations with `div_val` 1, pre-LayerNorm or shared position biases are refused.
+
+### Models and provenance
+
+- `transfo-xl-wt103` is the Hugging Face checkpoint `transfo-xl/transfo-xl-wt103` at revision `40a186da79458c9f9de846edfaea79c412137f97`: 18 layers, d 1024, 16 heads of 64, MLP width 4096, a vocabulary of 267,735 words, and an adaptive embedding and softmax with four clusters (ids below 20,000, 40,000 and 200,000, widths 1024, 256, 64, 16). `txl-tiny` has random weights (4 layers, 2 heads, d 16, vocabulary 64 in four clusters) and works offline. Both belong to the family `txl` (`wsbench/models/txl.py`).
+- Pinned files and SHA-256: `config.json` `5ccc2e5ae36a26fa0edccfc9fd16aba633bde30aa3cadca17e2394480b823ada`; `pytorch_model.bin` `edd5e62f5edb8ef65703ef827ab0bcd16ab29f2b853cfd9d11d81faa1bc7a0fb` (1,140,884,800 bytes, the legacy torch format); `vocab.json` `24e5bbda51446a21610bd58bb1ebdefee85766d0b3715f35da09babead595243` (267,735 words; `<eos>` 0, `<unk>` 24).
+- `wsbench fetch transfo-xl-wt103` downloads the three files into `WSB_HOME/models/transfo-xl-wt103/`. Each file goes to a temporary file first and is renamed after its hash check. `wsbench fetch all` still means pythia-14m and ARC. The pickled files of the repository (`vocab.pkl`, `vocab.bin`, `corpus.bin`) are never fetched, and the weights are read with `torch.load(weights_only=True)` after the hash check. `/api/health` reports the checkpoint under `models_local`, and the header shows it.
+- Size: 249 tensors with 285,205,322 parameters, each stored once. Counting the seven tied tensors twice gives 322,473,146: the four softmax weights are the embedding tables, and three of the four softmax projections are the embedding projections. The paper gives 257M for this model.
+- Licence: the Hugging Face model card states no licence. The original code, kimiyoung/transformer-xl, is Apache-2.0, and WikiText-103 is CC BY-SA. The Language tab lists this under Licences and attribution.
+
+### Function and language
+
+- A model state holds each tensor once. The softmax weights and the tied projections are stored under their `transformer.word_emb.*` names, so a block edit of `transformer.word_emb.emb_layers.{c}.weight` changes the embedding and the softmax together. The duplicate names (`crit.out_layers.{c}.weight` and the tied `crit.out_projs.{c}`) are rejected with `E_TARGET`, and the message names the tensor to use. Operators are copy-on-write: they share every tensor they leave alone.
+- WSBench measures one segment without memory, with the plain causal mask, as on the first segment of the original evaluation. Hugging Face's TransfoXL called without `mems` prepends 1600 all-zero memory slots to every layer instead. They act as an attention sink and lower the probe loss from 4.7249 to 4.1357 nats. `txl.forward(..., zero_mems=1600)` reproduces that call.
+- The probe is the Pythia probe's prose in WikiText-103 tokenisation: 122 tokens, all in the vocabulary. The bench compares the log-probabilities of the full adaptive softmax where it compares logits for NeoX. `max_abs_dlogits` and `rel` are therefore log-probability differences; the largest |log-probability| of the probe is 43.7167.
+- The positional frequencies are the checkpoint's float32 table (`transformer.pos_emb.inv_freq`), within 8.2e-8 relative of the float64 formula. The float64 formula would move the probe log-probabilities by up to 6.4e-6.
+- Agreement with transformers 4.46.3 in float64: `txl-tiny` agrees within 1.1e-14 in every log-probability, without memory, with zero memories, for a batch of two, with `same_length` off and with other clamp and window lengths. On the probe the largest log-probability difference is 3.9e-12. The loss is 4.724939573022554 against 4.724939573022569, and 4.135668769365871 against 4.135668769365872 with zero memories. The references are in `tests/data/txl_tiny_reference.json` and `tests/data/txl_wt103_probe.json`.
+- WSL: `model txl-tiny` and `model transfo-xl-wt103` take the claims gauge, reparam, approx and edit, and the layer operations of NeoX: `permute`, `scale(L[i].mlp, uniform(lo, hi))`, `rotate(L[i].mlp, orth)`, `vo`, `qk` (only on all dims, the default), `delete`, `swap`, `L[i] := ...` with `lerp`, `neg_writers`, `neg` and `align`, and `gridop` on any 2-D parameter. The language card has an "OPS ON Transformer-XL" section and FACTS lines for `transfo-xl-wt103`. The Editor palette, the Assist and Explore target menus and the agent accept the family. `wsbench/examples/transformer_xl.wsl` is the source of the card's numbers.
+
+### What is a symmetry in a post-LayerNorm Transformer-XL
+
+- Exact: permuting MLP neurons; positive per-neuron rescaling, because ReLU(c z) = c ReLU(z) for c > 0 (it is not exact through GELU in NeoX); permuting heads, which moves each head's q, k and v rows, r_net rows, both position biases and o_net columns together; a change of basis N of one head's values (v → N v, o_net → o_net N⁻¹); and a change of basis A of one head's queries and keys on all its dimensions. The Q/K case maps q, r_w_bias and r_r_bias to A·, and k and the head's r_net rows to A⁻ᵀ·. This keeps both the content score (q + r_w_bias)·k and the position score (q + r_r_bias)·r. Aligning a layer to another is a composition of these permutations. On `transfo-xl-wt103` they change the log-probabilities by 6.5e-16 to 1.3e-15 relative in L9, and by up to 9.1e-14 in the other layers measured.
+- Not exact: rotating MLP neurons, because ReLU acts per neuron. `neg(L)` is not exact either. In attention every score is a product of two negated factors, and the negated o_net cancels the negated values, so the attention output does not change. The MLP becomes -W₃ ReLU(-z) - b₃, which is not W₃ ReLU(z) + b₃. On the probe, `L9 := neg(L9)` costs +4.73 nats.
+- Not defined (`E_MODEL`, with the reason in the message): `fold_ln`, `center_writers`, `ln_to_rms`, `rotate(resid, ...)` and `scale(resid, ...)`. Every sublayer ends in x ← LN(x + f(x)), so the residual stream itself is the output of a LayerNorm. Its gain and bias feed the next layer and the skip connection alike, so no reader can absorb them, and a rotation or scaling of the stream does not pass through the next LayerNorm. `rope_pairs` and `qk(..., dims=pass)` are not defined either: Transformer-XL has relative sinusoidal positions with learned biases and no rotary dimensions.
+- `delete(L[i])` zeroes what the layer adds to the residual stream (o_net, CoreNet.3 and its bias). The two post-LayerNorms stay, so a deleted layer maps x to LN2(LN1(x)), not to x.
+
+### Measurements on transfo-xl-wt103
+
+All values are from `wsbench/examples/transformer_xl.wsl` (seed 0) through the executor, in nats on the 122-token probe. The base loss is 4.7249, and L[mid] is L9.
+
+- Exact symmetries (CONFIRMED): MLP permutation and rescaling, head permutation, V/O and Q/K basis changes and align, with relative changes from 7.3e-16 to 1.2e-15.
+- Not symmetries (REFUTED): rotating the L9 MLP (+4.72) and `L9 := neg(L9)` (+4.73).
+- Edits: deleting L9 gives -0.05 (control +0.75) and deleting L10 alone -0.01. Deleting L8 and L10 together costs +0.70. Swapping L8 and L9 costs +3.53, `L10 := neg_writers(L8)` +4.58, `L9 := lerp(L8, L10, 0.5)` +0.94 and rotating the L9 MLP +4.73. A rot90 of one 64 × 64 block of L9's o_net gives -0.005.
+- `pytest -m network tests/test_txl.py` repeats these measurements and checks the card's numbers against them.
+
+### Executor and cost
+
+- The control of an edit puts random noise of the edit's norm on exactly the entries the edit changed, as for NeoX, but it draws the noise differently. The NeoX control draws one generator sequence for every tensor in key order, unchanged tensors included, so the sequence stays stable. On `transfo-xl-wt103` that would be 285M normal draws per edit. The Transformer-XL control draws only for the changed tensors. Each tensor gets its own generator, seeded with ((seed + 999,983) · 2³² + CRC-32 of the tensor name) mod 2⁶⁴, so the noise of a tensor depends only on the statement's seed and the tensor's name. Transformer-XL and NeoX controls are therefore not draw-for-draw comparable.
+- The change report checks identity (`a is b`) before it compares values. With copy-on-write an operation replaces 1 to 26 of the 249 tensors, and only those are compared.
+- On four CPU threads `transfo-xl-wt103` loads in 4 to 8 s, of which the hash checks take 1.3 s. A forward pass takes 0.9 to 1.2 s. A gauge statement takes 0.6 to 1.5 s (one forward pass), and an edit takes 1.5 to 3 s (the edit and its control). `rotate(L[i].mlp, orth)` adds 2 to 4 s for the 4096 × 4096 orthogonal matrix, and `align` adds 2.5 to 3.5 s for the assignment of 4096 neurons. The 16-statement example takes 31 s after a 4.2 s load. Times varied by a factor of two on the shared development machine.
+- Memory: the float64 state needs 2.12 GiB, and the baseline log-probabilities [1, 122, 267,735] another 261 MB. The process peaks at 3.0 GiB after loading and at 3.7 GiB while running the example.
+- Each line keeps its changed tensors for the tensor views. On `transfo-xl-wt103` that is 8 to 208 MiB per line: 8 MiB for a gridop on an o_net block, 32 MiB for a V/O or Q/K basis change, 40 MiB for a delete, 64 MiB for an MLP permutation or rotation, 104 MiB for a lerp or neg of a layer, 156 MiB for a gridop on the first embedding table and 208 MiB for a swap. A swap keeps the baseline's own tensors and allocates nothing new. The 16 statements of the example keep 1.13 GiB, of which 0.86 GiB are new tensors; a 20-statement measurement kept 1.35 GiB of new tensors. That is why the kept states now have a 2 GiB budget (see Implementation decisions).
+- A tensor view of the 20,000 × 1024 embedding table takes up to 1 s and sends about 700 KiB.
 
 ## Acceptance measurements
 

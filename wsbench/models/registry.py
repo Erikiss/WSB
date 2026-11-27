@@ -79,6 +79,28 @@ def _txl_shapes(S):
     return out
 
 
+def txl_tied(S):
+    """Transformer-XL: HF state-dict name of each tied duplicate -> the name its tensor is stored under (once)."""
+    clusters = range(len(S['cutoffs']) + 1)
+    tied = {f'crit.out_layers.{c}.weight': f'transformer.word_emb.emb_layers.{c}.weight' for c in clusters}
+    tied.update({f'crit.out_projs.{c}': f'transformer.word_emb.emb_projs.{c}' for c in clusters if S['tie_projs'][c]})
+    return tied
+
+
+_POST_LN = 'is not defined for post-LayerNorm Transformer-XL'
+# WSL operations without a Transformer-XL meaning. Validation rejects them with E_MODEL and this message; the keys
+# name the operation (rotate_resid = rotate(resid, ...), qk_pass = qk(..., dims=pass)). Torch-free, for wsbench.lang.
+TXL_UNDEFINED = {
+    'fold_ln': f'fold_ln {_POST_LN}',
+    'center_writers': f'center_writers {_POST_LN}',
+    'ln_to_rms': f'ln_to_rms {_POST_LN}',
+    'rotate_resid': f'rotate(resid, ...) {_POST_LN}: a LayerNorm acts on the residual stream after every sublayer',
+    'scale_resid': f'scale(resid, ...) {_POST_LN}: a LayerNorm acts on the residual stream after every sublayer',
+    'rope_pairs': 'rope_pairs is not defined for Transformer-XL: it has relative sinusoidal positions, not RoPE',
+    'qk_pass': 'qk(..., dims=pass) is not defined for Transformer-XL: it has no rotary dimensions; use dims=all',
+}
+
+
 PROBE_TEXT = ("The river leaves the mountains in late spring, when the snow begins to melt and the water turns "
         "grey with silt. Farmers in the valley wait for this moment, because the flood brings soil to the "
         "fields and fills the canals that run between the villages. In the old town, the market opens at "

@@ -14,9 +14,8 @@ CLAIMS = {"gauge", "reparam", "edit", "approx", "train", "path", "solve"}
 
 
 def valid_model(name):
-    if name in ("neox-tiny", "pythia-14m", "modadd"):
-        return True
-    return bool(re.fullmatch(r"grid:task[0-9]{3}", name)) and 1 <= int(name[-3:]) <= 400
+    """A model of the registry: the NeoX and Transformer-XL models, modadd, grid:task001 ... grid:task400."""
+    return name in SHAPES
 
 
 def expand_range(a, b, s):

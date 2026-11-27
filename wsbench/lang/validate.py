@@ -1,24 +1,31 @@
 """Static WSL checks, in the diagnostic priority order of the language."""
 import math
-from wsbench.models.registry import SHAPES, param_shapes
+from wsbench.models.registry import SHAPES, TXL_UNDEFINED, param_shapes, txl_tied
 from .ast import Assignment, Call, Range, String, Target, reserved
 from .lexer import Problem
 
 
 NEOX = {"fold_ln", "center_writers", "ln_to_rms", "rotate", "scale", "permute",
         "vo", "qk", "rope_pairs", "delete", "swap", "gridop"}
+# Transformer-XL has the layer-local operations; the others have no meaning there (UNDEFINED gives the reason).
+TXL = NEOX - {"fold_ln", "center_writers", "ln_to_rms", "rope_pairs"}
+LAYER_VALUES = {"perm", "uniform", "lerp", "neg", "neg_writers", "align", "block"}
 TOP = {
     **{claim: NEOX for claim in ("edit", "gauge", "reparam", "approx")},
     "train": {"modadd"}, "path": {"lerp", "add", "scale", "cosine"},
     "solve": {"prim", "chain", "compile", "golf"},
 }
-CLAIMS = {"neox": {"gauge", "reparam", "edit", "approx"}, "grid": {"solve"},
-          "modadd": {"train", "path"}}
+WEIGHTS = {"neox", "txl"}           # families whose statements edit the weight tensors of a language model
+CLAIMS = {"neox": {"gauge", "reparam", "edit", "approx"}, "txl": {"gauge", "reparam", "edit", "approx"},
+          "grid": {"solve"}, "modadd": {"train", "path"}}
 NAMES = {
-    "neox": NEOX | {"perm", "uniform", "lerp", "neg", "neg_writers", "align", "block"},
+    "neox": NEOX | LAYER_VALUES,
+    "txl": TXL | LAYER_VALUES,
     "modadd": TOP["train"] | TOP["path"] | {"ckpt", "diff", "grokfast", "at"},
     "grid": TOP["solve"],
 }
+# Operations, or forms of them, that a family does not define: E_MODEL with the reason.
+UNDEFINED = {"txl": TXL_UNDEFINED}
 PRIMITIVES = {"identity", "rot90", "rot180", "rot270", "hmirror", "vmirror", "dmirror", "cmirror"}
 SQUARE_ONLY = {"rot90", "rot270", "dmirror", "cmirror"}
 
@@ -73,15 +80,18 @@ def member(value, choices):
     return type(value) is str and value in choices
 
 
+def resid_form(call):
+    return bool(call.args) and call.args[0] == "resid"
+
+
 def signature(call, family, slot):
     name = call.name
-    if name in ("rotate", "scale") and family == "neox":
-        resid = call.args and call.args[0] == "resid"
-        name = ("resid_" if resid else "mlp_") + name
+    if name in ("rotate", "scale") and family in WEIGHTS:
+        name = ("resid_" if resid_form(call) else "mlp_") + name
     elif name == "scale":
         name = "intervention_scale" if slot == "intervention_scale" else "path_scale"
     elif name == "lerp":
-        name = "layer_lerp" if family == "neox" else "path_lerp"
+        name = "layer_lerp" if family in WEIGHTS else "path_lerp"
     if name == "chain":
         return ("prim",) * max(1, len(call.args)), {}
     return SIGNATURES[name]
@@ -104,18 +114,33 @@ def check_name(name, allowed, family, col):
         return
     if name in NAMES[family]:
         bad(col, f"{name} is not allowed here")
+    if name in UNDEFINED.get(family, {}):
+        raise Problem("E_MODEL", col, UNDEFINED[family][name])
     if any(name in names for names in NAMES.values()):
         raise Problem("E_MODEL", col, f"{name} belongs to another model family")
     raise Problem("E_UNKNOWN_OP", col, f"unknown call {name}")
 
 
+def check_form(call, family):
+    """E_MODEL for a form of an allowed call that the family does not define: on Transformer-XL rotate(resid, ...),
+    scale(resid, ...) and qk(..., dims=pass)."""
+    undefined = UNDEFINED.get(family, {})
+    if call.name in ("rotate", "scale") and resid_form(call) and call.name + "_resid" in undefined:
+        raise Problem("E_MODEL", call.col, undefined[call.name + "_resid"])
+    if call.name == "qk" and "qk_pass" in undefined:
+        for arg in call.arguments:
+            if arg.key == "dims" and member(arg.value, {"pass"}):
+                raise Problem("E_MODEL", arg.key_col, undefined["qk_pass"])
+
+
 def check_names(value, slot, family, allowed=None):
     if isinstance(value, Assignment):
-        if family != "neox":
-            raise Problem("E_MODEL", value.col, "assignments require a neox model")
+        if family not in WEIGHTS:
+            raise Problem("E_MODEL", value.col, "assignments require a neox or txl model")
         check_names(value.expr, "expression", family)
     elif isinstance(value, Call):
         check_name(value.name, CALLS.get(slot, ()) if allowed is None else allowed, family, value.col)
+        check_form(value, family)
         for arg, expected in typed_args(value, *signature(value, family, slot)):
             check_names(arg.value, expected, family)
     elif isinstance(value, list):
@@ -259,6 +284,10 @@ def check_target(node, shape, model):
     if isinstance(node, Call) and node.name == "block":
         name, r0, r1, c0, c1 = node.args
         dims = param_shapes(shape).get(name)
+        stored = txl_tied(shape).get(name) if shape["family"] == "txl" else None
+        if stored is not None:
+            raise Problem("E_TARGET", node.arguments[0].col, f"{name} is tied to {stored}: use that name "
+                          "(one tensor, used by the embedding and the softmax)")
         if dims is None or len(dims) != 2:
             raise Problem("E_TARGET", node.arguments[0].col, f"unknown or non-matrix parameter {name}")
         if not (0 <= r0 < r1 <= dims[0] and 0 <= c0 < c1 <= dims[1]):
@@ -279,14 +308,14 @@ def check(stmt, seen):
     if stmt.claim in ("train", "path", "solve") and len(stmt.ops) != 1:
         bad(stmt.claim_col, f"{stmt.claim} requires one op")
     for op in stmt.ops:
-        check_names(op, None, stmt.family, TOP[stmt.claim])
+        check_names(op, None, stmt.family, TOP[stmt.claim] & NAMES[stmt.family])
     shape = SHAPES[stmt.model]
     for op in stmt.ops:
         if isinstance(op, Assignment):
             check_value(op.expr, "expression", op.expr.col, shape, op)
         else:
             check_call(op, None, shape)
-    if stmt.family == "neox":
+    if stmt.family in WEIGHTS:
         for op in stmt.ops:
             for node in walk(op):
                 check_target(node, shape, stmt.model)

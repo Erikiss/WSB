@@ -69,8 +69,8 @@ def _parameters(request):
     text, model = request.get("text"), request.get("model")
     if not isinstance(text, str) or not isinstance(model, str):
         raise AssistRequestError("text and model must be strings")
-    if SHAPES.get(model, {}).get("family") not in {"neox", "grid"}:
-        raise AssistRequestError("model must be a NeoX model or grid:task001 through grid:task400")
+    if SHAPES.get(model, {}).get("family") not in {"neox", "txl", "grid"}:
+        raise AssistRequestError("model must be a NeoX or Transformer-XL model or grid:task001 through grid:task400")
     roles = request.get("roles", {})
     if not isinstance(roles, dict) or any(
         k not in openrouter.DEFAULT_ROLES or not isinstance(v, str) or not v.strip() for k, v in roles.items()

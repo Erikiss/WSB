@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from .neox import SQUARE_ONLY, TORCH_PRIMITIVES, rand_gl, rand_orth, rand_perm, rand_uniform  # noqa: F401 (shared)
+from .registry import TXL_UNDEFINED, txl_tied
 
 EMB = 'transformer.word_emb.emb_layers.{}.weight'   # [vocab_c, d_emb_c]  token table of cluster c = its softmax weight
 EPROJ = 'transformer.word_emb.emb_projs.{}'          # [d, d_emb_c]        embedding projection; softmax one if tied
@@ -44,16 +45,7 @@ LAYER_KEYS = (RR, RW, QKV, O, LN1 + 'weight', LN1 + 'bias', R, FF0W, FF0B, FF3W,
 WRITERS = (O, FF3W, FF3B)          # add into the residual stream (before the post-LayerNorm)
 GEOMETRY = ('n_layers', 'n_heads', 'd', 'dh', 'd_mlp', 'vocab', 'd_embed', 'cutoffs', 'div_val', 'tie_projs')
 
-_POST_LN = 'is not defined for post-LayerNorm Transformer-XL'
-UNDEFINED = {   # WSL operations without a Transformer-XL meaning (validation: E_MODEL with this message)
-    'fold_ln': f'fold_ln {_POST_LN}',
-    'center_writers': f'center_writers {_POST_LN}',
-    'ln_to_rms': f'ln_to_rms {_POST_LN}',
-    'rotate_resid': f'rotate(resid, ...) {_POST_LN}: a LayerNorm acts on the residual stream after every sublayer',
-    'scale_resid': f'scale(resid, ...) {_POST_LN}: a LayerNorm acts on the residual stream after every sublayer',
-    'rope_pairs': 'rope_pairs is not defined for Transformer-XL: it has relative sinusoidal positions, not RoPE',
-    'qk_pass': 'qk(..., dims=pass) is not defined for Transformer-XL: it has no rotary dimensions; use dims=all',
-}
+UNDEFINED = TXL_UNDEFINED   # WSL operations without a Transformer-XL meaning (validation: E_MODEL with this message)
 
 
 @dataclass(frozen=True)
@@ -150,8 +142,7 @@ def param_names(cfg):
 
 def tied_pairs(cfg):
     """(name in the HF state dict, name it is stored under in W) for every tied tensor."""
-    pairs = [(f'crit.out_layers.{c}.weight', EMB.format(c)) for c in range(cfg.n_clusters + 1)]
-    return pairs + [(OPROJ.format(c), EPROJ.format(c)) for c in range(cfg.n_clusters + 1) if cfg.tie_projs[c]]
+    return list(txl_tied(geometry(cfg)).items())
 
 
 def make_tiny(seed=0, cfg=TINY_CFG):

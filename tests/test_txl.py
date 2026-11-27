@@ -4,11 +4,14 @@ import json
 import math
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from wsbench.exec.executor import run_script
+from wsbench.lang.card import LANGUAGE_CARD
 from wsbench.models import fetch, txl
 from wsbench.models.neox import rand_gl, rand_orth, rand_uniform
 from wsbench.models.registry import SHAPES, load_model, param_shapes
@@ -349,3 +352,32 @@ def test_wt103_reference():
     assert sum(moved[k] is not W0[k] for k in W0) == 5
     rel = max_diff(txl.forward(cfg, moved, ids), model.logits0) / model.max_logit0
     assert rel <= 1e-9
+
+
+@pytest.mark.network
+def test_wt103_example_reproduces_the_language_card():
+    """wsbench/examples/transformer_xl.wsl on the real checkpoint: the verdicts and the numbers of the card's FACTS."""
+    fetch.fetch('transfo-xl-wt103')
+    script = (Path(__file__).parents[1] / 'wsbench' / 'examples' / 'transformer_xl.wsl').read_text()
+    start = perf_counter()
+    rows = {v['label']: v for v in run_script(script)}
+    seconds = perf_counter() - start
+    assert list(rows) == [f'X{n}' for n in range(1, 17)] and all(v['error'] is None for v in rows.values())
+    for n in range(1, 7):                        # exact symmetries
+        row = rows[f'X{n}']
+        assert (row['status'], row['measured']) == ('CONFIRMED', 'exact') and row['metrics']['rel'] <= 1e-13
+    for n in (7, 8):                             # rotating MLP neurons and neg(L) are not symmetries
+        assert (rows[f'X{n}']['status'], rows[f'X{n}']['measured']) == ('REFUTED', 'edit')
+    deltas = {'X7': 4.7240, 'X8': 4.7256, 'X9': -0.0498, 'X10': 3.5286, 'X11': 4.5838, 'X12': -0.0083, 'X13': 0.7036,
+              'X14': 0.9440, 'X15': 4.7314, 'X16': -0.0048}
+    for label, dloss in deltas.items():
+        metrics = rows[label]['metrics']
+        assert metrics['dloss'] == pytest.approx(dloss, abs=5e-4), label
+        if label not in ('X7', 'X8'):
+            assert rows[label]['status'] == 'MEASURED' and metrics['control']['ratio'] is not None
+    for label in ('X9', 'X10', 'X11', 'X12', 'X13', 'X14', 'X15'):
+        assert f"{rows[label]['metrics']['dloss']:+.2f}" in LANGUAGE_CARD, label
+    assert f"base loss {rows['X1']['metrics']['loss0']:.4f}" in LANGUAGE_CARD
+    swap = rows['X10']['metrics']['changed_tensors']
+    assert len(swap) == 26 and {t['name'].split('.')[2] for t in swap} == {'8', '9'}
+    print(f'16 transfo-xl-wt103 statements: {seconds:.1f} s')

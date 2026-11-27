@@ -108,6 +108,7 @@ function showHealth(health) {
   $('health').replaceChildren();
   for (const [key, value, available] of [
     ['pythia-14m', health.models_local['pythia-14m'] ? 'yes' : 'no', health.models_local['pythia-14m']],
+    ['transfo-xl-wt103', health.models_local['transfo-xl-wt103'] ? 'yes' : 'no', health.models_local['transfo-xl-wt103']],
     ['ARC data', health.arc_local ? 'yes' : 'no', health.arc_local],
     ['LLM', health.llm, health.llm !== 'no-key'],
     ['Claude direct', health.anthropic ? 'yes' : 'no', health.anthropic]
@@ -120,7 +121,7 @@ function showHealth(health) {
 function drawPalette() {
   const visible = language.ops.filter(op => op.family === family);
   $('families').replaceChildren();
-  for (const name of ['neox','modadd','grid']) {
+  for (const name of ['neox','txl','modadd','grid']) {
     const tab = button(name, () => { family = name; drawPalette(); });
     tab.setAttribute('aria-pressed', String(family === name));
     $('families').append(tab);
