@@ -500,6 +500,17 @@ function showDetail(pane, verdict) {
     detail.append(el('p','legend',verdict.status === 'RUNNING' ? 'Waiting for measurements…' : 'No measurements available.'));
   }
 }
+// The tensor panel's default block is square, at most 16 x 16, so the rot90 that 'Insert gridop(...)' writes is valid
+// for every matrix (some Transformer-XL matrices have a side below 16). A block made non-square gets rot180, which
+// fits any block.
+function defaultBlock(shape) {
+  const side = Math.min(16, shape[0], shape[1]);
+  return [0, side, 0, side];
+}
+function gridopStatement(name, [r0, r1, c0, c1]) {
+  const primitive = r1 - r0 === c1 - c0 ? 'rot90' : 'rot180';
+  return 'edit gridop(' + primitive + ', block(' + JSON.stringify(name) + ', ' + [r0, r1, c0, c1].join(', ') + '))';
+}
 function tensorPanel(pane, verdict, tensor, target) {
   const revision = ++pane.revision;
   let load = 0;
@@ -509,9 +520,9 @@ function tensorPanel(pane, verdict, tensor, target) {
   const controls = el('div','detail-controls');
   const results = el('div','triple'), legend = el('p','legend');
   if (tensor.shape.length === 2) {
+    const [r0, r1, c0, c1] = defaultBlock(tensor.shape);
     for (const [label,defaultValue,limit] of [
-      ['r0',0,tensor.shape[0]],['r1',Math.min(16,tensor.shape[0]),tensor.shape[0]],
-      ['c0',0,tensor.shape[1]],['c1',Math.min(16,tensor.shape[1]),tensor.shape[1]]
+      ['r0',r0,tensor.shape[0]],['r1',r1,tensor.shape[0]],['c0',c0,tensor.shape[1]],['c1',c1,tensor.shape[1]]
     ]) {
       const input = el('input');
       input.type = 'number'; input.min = '0'; input.max = limit; input.step = '1'; input.value = defaultValue;
@@ -525,7 +536,7 @@ function tensorPanel(pane, verdict, tensor, target) {
     controls.append(toggle, button('Insert gridop(...)', () => {
       if (!validBounds()) { legend.textContent = 'Choose valid integer bounds for this tensor.'; return; }
       location.hash = 'editor';
-      insertText('edit gridop(rot90, block(' + JSON.stringify(tensor.name) + ', ' + Object.values(bounds).map(n=>n.valueAsNumber).join(', ') + '))',true);
+      insertText(gridopStatement(tensor.name, Object.values(bounds).map(n=>n.valueAsNumber)),true);
     }));
   }
   function validBounds() {

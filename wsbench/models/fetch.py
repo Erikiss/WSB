@@ -1,8 +1,8 @@
 """Fetch the pinned model snapshots and check each file before use."""
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from wsbench.paths import home
 
@@ -68,18 +68,30 @@ def _check(path: Path, expected: str, name: str = 'pythia-14m'):
 
 
 def verify(name, directory=None):
-    """Check every file of the snapshot; a file with the wrong hash is deleted."""
+    """Check every file of the snapshot: first that all of them are there, then their hashes. A file with the wrong
+    hash is deleted."""
     directory = model_dir(name) if directory is None else Path(directory)
-    for file, digest in _snapshot(name).sha256.items():
-        path = directory / file
-        if not path.is_file():
-            raise DownloadError(f'run: wsbench fetch {name}')
-        _check(path, digest, name)
+    files = _snapshot(name).sha256
+    if not all((directory / file).is_file() for file in files):
+        raise DownloadError(f'run: wsbench fetch {name}')     # before hashing 1.1 GB that cannot be used anyway
+    for file, digest in files.items():
+        _check(directory / file, digest, name)
 
 
-def fetch(name):
-    """Download the missing files of the snapshot (each to a temporary file in the model directory, renamed after
-    its hash check) and check the files that are already there."""
+def partial_path(directory, file):
+    """The download of `file` in progress. The name is fixed, so a fetch that was killed (SIGKILL, SIGHUP, SIGTERM)
+    leaves at most one partial file per snapshot file, and the next fetch overwrites and then removes it."""
+    return Path(directory) / f'.{file}.part'
+
+
+# Temporary files of earlier versions (NamedTemporaryFile in the model directory), left behind by a killed fetch.
+_LEGACY_TMP = re.compile(r'tmp[a-z0-9_]{8}')
+
+
+def fetch(name, progress=None):
+    """Download the missing files of the snapshot and check the ones that are already there; a file with the wrong
+    hash is deleted and downloaded again. Each download goes to partial_path(directory, file) and is renamed after
+    its hash check. progress(file, received_bytes, total_bytes or None) is called after each received chunk."""
     import httpx
 
     snapshot = _snapshot(name)
@@ -87,25 +99,33 @@ def fetch(name):
     file = None
     try:
         directory.mkdir(parents=True, exist_ok=True)
+        for path in directory.iterdir():
+            if _LEGACY_TMP.fullmatch(path.name) and path.is_file():
+                path.unlink(missing_ok=True)
         with httpx.Client(follow_redirects=True, timeout=90) as client:
             for file, expected in snapshot.sha256.items():
                 dest = directory / file
                 if dest.is_file():
-                    _check(dest, expected, name)
-                    continue
-                tmp = None
+                    try:
+                        _check(dest, expected, name)
+                        continue
+                    except DownloadError:
+                        pass                    # _check deleted the corrupt file: download it again
+                part = partial_path(directory, file)
                 try:
                     with client.stream('GET', f'{snapshot.base_url}/{file}') as response:
                         response.raise_for_status()
-                        with NamedTemporaryFile(dir=directory, delete=False) as fp:
-                            tmp = Path(fp.name)
+                        total = response.headers.get('content-length')
+                        total = int(total) if total and total.isdigit() else None
+                        with part.open('wb') as fp:
                             for chunk in response.iter_bytes(1024 * 1024):
                                 fp.write(chunk)
-                    _check(tmp, expected, name)
-                    tmp.replace(dest)
+                                if progress is not None:
+                                    progress(file, response.num_bytes_downloaded, total)
+                    _check(part, expected, name)
+                    part.replace(dest)
                 finally:
-                    if tmp is not None:
-                        tmp.unlink(missing_ok=True)
+                    part.unlink(missing_ok=True)
     except httpx.HTTPStatusError as exc:
         raise DownloadError(f'{file}: HTTP {exc.response.status_code}; run: wsbench fetch {name}') from exc
     except (OSError, httpx.RequestError) as exc:

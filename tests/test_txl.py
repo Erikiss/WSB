@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from wsbench.exec.executor import run_script
 from wsbench.lang.card import LANGUAGE_CARD
-from wsbench.models import fetch, txl
+from wsbench.models import fetch, registry, txl
 from wsbench.models.neox import rand_gl, rand_orth, rand_uniform
 from wsbench.models.registry import SHAPES, load_model, param_shapes
 
@@ -285,6 +285,40 @@ def test_load_tiny_model():
     assert model.max_logit0 == model.logits0.abs().max().item()
 
 
+@pytest.fixture
+def fresh_model_cache():
+    registry._load_model.cache_clear()
+    yield registry._load_model
+    registry._load_model.cache_clear()           # drop the stand-in models below
+
+
+def test_the_model_cache_holds_every_weight_model(tmp_path, monkeypatch, fresh_model_cache):
+    """Using the other weight models must not evict transfo-xl-wt103 (a reload re-hashes 1.1 GB and rebuilds 2.4 GiB).
+    Offline: pythia-14m and transfo-xl-wt103 are stood in for by the tiny models of their family."""
+    monkeypatch.setenv('WSB_HOME', str(tmp_path))
+    assert registry.WEIGHT_MODELS == ('neox-tiny', 'pythia-14m', 'txl-tiny', 'transfo-xl-wt103')
+    assert fresh_model_cache.cache_info().maxsize == len(registry.WEIGHT_MODELS)
+    loads = []
+
+    def stand_in(load, tiny):
+        def loader(name, directory):
+            loads.append(name)
+            return load(tiny if directory is not None else name, None)
+        return loader
+
+    monkeypatch.setattr(registry, '_load_neox', stand_in(registry._load_neox, 'neox-tiny'))
+    monkeypatch.setattr(registry, '_load_txl', stand_in(registry._load_txl, 'txl-tiny'))
+    monkeypatch.setitem(SHAPES, 'pythia-14m', SHAPES['neox-tiny'])
+    monkeypatch.setitem(SHAPES, 'transfo-xl-wt103', SHAPES['txl-tiny'])
+    order = ['transfo-xl-wt103', 'pythia-14m', 'txl-tiny', 'neox-tiny']   # wt103 first: the others come after it
+    first = {name: load_model(name) for name in order}
+    assert load_model('transfo-xl-wt103') is first['transfo-xl-wt103']
+    assert load_model('pythia-14m') is first['pythia-14m']
+    assert loads == order
+    info = fresh_model_cache.cache_info()
+    assert (info.misses, info.hits) == (4, 2)
+
+
 # ---------------------------------------------------------------- pinned snapshots
 
 def test_snapshot_table_keeps_the_pythia_names():
@@ -300,19 +334,25 @@ def test_snapshot_table_keeps_the_pythia_names():
         fetch.model_dir('txl-tiny')
 
 
-def test_fetch_helpers(tmp_path, monkeypatch):
-    monkeypatch.setenv('WSB_HOME', str(tmp_path))
-    name = 'transfo-xl-wt103'
-    directory = fetch.model_dir(name)
+@pytest.fixture
+def wt103_hub(hub):
+    """transfo-xl-wt103 stand-in files on the offline hub of conftest.py (in WSB_HOME = tmp_path)."""
+    return hub('transfo-xl-wt103')
+
+
+def test_fetch_helpers(tmp_path, monkeypatch, wt103_hub):
+    hub = wt103_hub
+    name, directory, files = hub.name, hub.directory, hub.files
+    pinned = fetch.SNAPSHOTS[name]
+    monkeypatch.setitem(fetch.SNAPSHOTS, name, replace(pinned, sha256={f: '0' * 64 for f in pinned.sha256}))
     assert directory == tmp_path / 'models' / name and not fetch.local(name)
     with pytest.raises(fetch.DownloadError, match='^run: wsbench fetch transfo-xl-wt103$'):
         fetch.verify(name)
     directory.mkdir(parents=True)
-    files = {file: f'stand-in for {file}'.encode() for file in fetch.SNAPSHOTS[name].sha256}
     for file, data in files.items():
         (directory / file).write_bytes(data)
     assert fetch.local(name)
-    with pytest.raises(fetch.DownloadError) as info:              # the pinned hashes do not match the stand-ins
+    with pytest.raises(fetch.DownloadError) as info:              # the hashes do not match the files
         fetch.verify(name)
     assert str(info.value) == 'SHA-256 mismatch; run: wsbench fetch transfo-xl-wt103'
     assert info.value.code == 'E_DOWNLOAD'
@@ -320,15 +360,89 @@ def test_fetch_helpers(tmp_path, monkeypatch):
     with pytest.raises(fetch.DownloadError, match='^run: wsbench fetch transfo-xl-wt103$'):
         load_model(name)
 
-    digests = {file: hashlib.sha256(data).hexdigest() for file, data in files.items()}
-    monkeypatch.setitem(fetch.SNAPSHOTS, name, replace(fetch.SNAPSHOTS[name], sha256=digests))
+    monkeypatch.setitem(fetch.SNAPSHOTS, name, pinned)            # the hub's hashes again
     (directory / 'config.json').write_bytes(files['config.json'])
     fetch.verify(name)
     fetch.fetch(name)                                             # every file present and correct: nothing to download
-    (directory / 'vocab.json').write_bytes(b'corrupt')
+    assert hub.requests == []
+
+
+def test_verify_finds_a_missing_file_before_it_hashes_the_others(wt103_hub, monkeypatch):
+    hub = wt103_hub
+    hub.directory.mkdir(parents=True)
+    for file in ('config.json', 'pytorch_model.bin'):             # vocab.json is missing (an interrupted fetch)
+        (hub.directory / file).write_bytes(hub.files[file])
+    hashed = []
+    monkeypatch.setattr(fetch, '_check', lambda path, *args: hashed.append(path.name))
+    with pytest.raises(fetch.DownloadError, match='^run: wsbench fetch transfo-xl-wt103$'):
+        fetch.verify(hub.name)
+    assert hashed == []                                           # no statement hashes 1.1 GB it cannot use
+
+
+def test_fetch_downloads_a_corrupt_file_again_and_leaves_no_partial_files(wt103_hub):
+    hub = wt103_hub
+    directory, files = hub.directory, hub.files
+    directory.mkdir(parents=True)
+    (directory / 'config.json').write_bytes(files['config.json'])                 # correct: kept, not downloaded
+    (directory / 'vocab.json').write_bytes(b'corrupt')                            # wrong hash: downloaded again
+    fetch.partial_path(directory, 'pytorch_model.bin').write_bytes(b'left by a fetch killed with SIGKILL')
+    (directory / 'tmpq8_x2kd0').write_bytes(b'left by a killed fetch of an earlier version')
+    (directory / 'tmp-notes.txt').write_bytes(b'not a temporary file of fetch()')
+    seen = []
+    fetch.fetch(hub.name, progress=lambda *args: seen.append(args))
+    assert hub.requests == ['pytorch_model.bin', 'vocab.json']
+    assert sorted(p.name for p in directory.iterdir()) == sorted([*files, 'tmp-notes.txt'])
+    assert all((directory / file).read_bytes() == data for file, data in files.items())
+    fetch.verify(hub.name)
+    sizes = {file: len(data) for file, data in files.items()}
+    assert {file for file, _, _ in seen} == {'pytorch_model.bin', 'vocab.json'}
+    assert all(total == sizes[file] and 0 < received <= total for file, received, total in seen)
+    assert seen[-1] == ('vocab.json', sizes['vocab.json'], sizes['vocab.json'])
+
+
+def test_an_interrupted_download_leaves_no_partial_file(wt103_hub):
+    import httpx
+
+    hub = wt103_hub
+
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            yield hub.files['pytorch_model.bin'][:1000]
+            raise httpx.ReadError('connection lost')
+
+    hub.serve['pytorch_model.bin'] = lambda request: httpx.Response(200, stream=Broken())
+    with pytest.raises(fetch.DownloadError, match='^connection lost; run: wsbench fetch transfo-xl-wt103$'):
+        fetch.fetch(hub.name)
+    assert [p.name for p in hub.directory.iterdir()] == ['config.json']          # downloaded before the failure
+    hub.serve['pytorch_model.bin'] = hub.files['pytorch_model.bin']
+    fetch.fetch(hub.name)
+    assert sorted(p.name for p in hub.directory.iterdir()) == sorted(hub.files)
+    assert hub.requests == ['config.json', 'pytorch_model.bin', 'pytorch_model.bin', 'vocab.json']
+
+
+def test_a_mismatching_download_is_not_kept(wt103_hub):
+    hub = wt103_hub
+    hub.serve['vocab.json'] = b'not the pinned vocabulary'
     with pytest.raises(fetch.DownloadError, match='^SHA-256 mismatch; run: wsbench fetch transfo-xl-wt103$'):
-        fetch.fetch(name)
-    assert not (directory / 'vocab.json').exists() and (directory / 'pytorch_model.bin').exists()
+        fetch.fetch(hub.name)
+    assert sorted(p.name for p in hub.directory.iterdir()) == ['config.json', 'pytorch_model.bin']
+
+
+def test_the_fetch_command_shows_progress_only_on_a_terminal(monkeypatch, capsys):
+    import sys
+    from wsbench import cli
+
+    calls = []
+    monkeypatch.setattr(fetch, 'fetch', lambda name, progress=None: calls.append((name, progress)))
+    assert cli.main(['fetch', 'transfo-xl-wt103']) == 0
+    monkeypatch.setattr(sys.stderr, 'isatty', lambda: True)
+    assert cli.main(['fetch', 'transfo-xl-wt103']) == 0
+    assert calls == [('transfo-xl-wt103', None), ('transfo-xl-wt103', cli._progress)]
+    cli._progress('config.json', 856, 856)                                       # below 1 MiB: no line
+    cli._progress('pytorch_model.bin', 512 * 2**20, 1088 * 2**20)
+    cli._progress('pytorch_model.bin', 1088 * 2**20, 1088 * 2**20)
+    assert capsys.readouterr().err == ('\rpytorch_model.bin: 512.0 MiB of 1088.0 MiB'
+                                       '\rpytorch_model.bin: 1088.0 MiB of 1088.0 MiB\n')
 
 
 # ---------------------------------------------------------------- the real checkpoint
@@ -377,6 +491,7 @@ def test_wt103_example_reproduces_the_language_card():
             assert rows[label]['status'] == 'MEASURED' and metrics['control']['ratio'] is not None
     for label in ('X9', 'X10', 'X11', 'X12', 'X13', 'X14', 'X15'):
         assert f"{rows[label]['metrics']['dloss']:+.2f}" in LANGUAGE_CARD, label
+    assert rows['X9']['metrics']['control']['dloss'] == pytest.approx(0.1509, abs=5e-4)     # NOTES.md: control +0.15
     assert f"base loss {rows['X1']['metrics']['loss0']:.4f}" in LANGUAGE_CARD
     swap = rows['X10']['metrics']['changed_tensors']
     assert len(swap) == 26 and {t['name'].split('.')[2] for t in swap} == {'8', '9'}

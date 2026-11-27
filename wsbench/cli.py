@@ -19,6 +19,14 @@ def _line(verdict):
     return row
 
 
+def _progress(file, received, total):
+    """One progress line per downloaded file of at least 1 MiB, rewritten in place (only on a terminal)."""
+    if total is not None and total < 2**20:
+        return
+    text = f"{file}: {received / 2**20:.1f} MiB" + (f" of {total / 2**20:.1f} MiB" if total else "")
+    print("\r" + text, end="\n" if total and received >= total else "", file=sys.stderr, flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="wsbench", description="Execute weight-space experiments.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -41,12 +49,12 @@ def main(argv=None):
         return 0
     if args.command == "fetch":
         try:
+            from .models.fetch import fetch as fetch_model
+            progress = _progress if sys.stderr.isatty() else None
             if args.what in ("all", "pythia-14m"):
-                from .models.fetch import fetch_pythia
-                fetch_pythia()
+                fetch_model("pythia-14m", progress)
             if args.what == "transfo-xl-wt103":
-                from .models.fetch import fetch as fetch_model
-                fetch_model(args.what)
+                fetch_model(args.what, progress)
             if args.what in ("all", "arc"):
                 from .arc.data import fetch_arc
                 fetch_arc()

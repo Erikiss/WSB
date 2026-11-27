@@ -75,7 +75,7 @@ OPS = [
          doc='edit'),
     dict(family='txl', call='L[i] := E',
          args='E = L[j] | lerp(X, Y, t) | neg_writers(X) | neg(X) | align(X -> Y). neg negates everything but the LayerNorms: the attention output is unchanged, the MLP is not.',
-         doc='depends: align is exact'),
+         doc='depends: L[i] := align(L[i] -> L[j]) is exact, a permutation of L[i] toward L[j]. align(L[j] -> L[i]) puts a permuted L[j] in slot i and is an edit that measures like L[i] := L[j]; L[j], lerp, neg_writers and neg are edits too.'),
     dict(family='txl', call='gridop(P, block("NAME", r0, r1, c0, c1))',
          args='NAME = a 2-D parameter of the unedited model. The softmax weight of cluster c is transformer.word_emb.emb_layers.{c}.weight (tied: one tensor for the embedding and the softmax).',
          doc='edit'),

@@ -184,8 +184,13 @@ def _control(model, after, kind, seed, metrics):
 
 
 def tensor_seed(seed, name):
-    """Seed of the control noise for one tensor: the statement's seed and a stable hash (CRC-32) of its name."""
-    return ((seed + CONTROL_SALT) * 2 ** 32 + zlib.crc32(name.encode('utf-8'))) % 2 ** 64
+    """Seed of the control noise for one tensor, a 32-bit value: the CRC-32 of the tensor's name, started from the
+    statement's seed (plus CONTROL_SALT) mod 2**32.
+
+    torch's CPU generator (mt19937) uses only the low 32 bits of a seed, so both inputs have to be mixed into those
+    bits. For one name, distinct seeds mod 2**32 give distinct generator seeds (CRC-32 is a bijection of its start
+    value), as for the NeoX control, which seeds with seed + CONTROL_SALT."""
+    return zlib.crc32(name.encode('utf-8'), (seed + CONTROL_SALT) % 2 ** 32)
 
 
 def _txl_control(model, after, kind, seed, metrics):
@@ -194,7 +199,8 @@ def _txl_control(model, after, kind, seed, metrics):
     Unlike the NeoX control, which draws one generator sequence for every tensor in key order (about 285M normal
     draws per edit on transfo-xl-wt103), this draws only for the changed tensors, each from its own generator seeded
     by tensor_seed(seed, name). The noise of a tensor therefore depends only on the statement's seed and the tensor's
-    name. Transformer-XL operators never add or remove tensors, and every unchanged tensor stays shared."""
+    name. Transformer-XL operators never add or remove tensors, and every unchanged tensor stays shared. Each noise
+    buffer becomes its control tensor in place, so the control holds one extra copy of the changed tensors, not two."""
     before = model.W0
     base = dict(before)
     noise, noise_sq = {}, 0.
@@ -206,8 +212,8 @@ def _txl_control(model, after, kind, seed, metrics):
         noise[name] = eps
         noise_sq += torch.linalg.vector_norm(eps).item() ** 2
     factor = metrics['param_dist'] / math.sqrt(noise_sq)
-    for name, eps in noise.items():
-        base[name] = before[name] + eps.mul_(factor)
+    for name in list(noise):
+        base[name] = noise.pop(name).mul_(factor).add_(before[name])     # = before + factor * eps, bit for bit
     return _control_result(txl, model, base, (), metrics)
 
 

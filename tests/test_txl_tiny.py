@@ -1,5 +1,6 @@
 """The executor on txl-tiny: verdicts, metrics, controls, copy-on-write and the thread policy."""
 import hashlib
+import math
 from pathlib import Path
 
 import pytest
@@ -126,7 +127,68 @@ def test_the_control_draws_each_tensor_from_its_own_generator(monkeypatch):
         assert torch.allclose(direction[tuple(layers)], expected / expected.norm(), atol=1e-12)
     assert torch.allclose(direction[(1,)], direction[(1, 3)], atol=1e-12)
     assert resolve.tensor_seed(seed, key) != resolve.tensor_seed(seed + 1, key) != resolve.tensor_seed(seed, L(2) + txl.O)
-    assert 0 <= resolve.tensor_seed(10 ** 30, key) < 2 ** 64
+    assert 0 <= resolve.tensor_seed(10 ** 30, key) < 2 ** 32       # torch's CPU generator keeps only 32 bits
+
+
+def test_the_control_noise_depends_on_the_seed_not_only_on_the_name():
+    """torch's CPU generator (mt19937) uses only the low 32 bits of a seed, so tensor_seed mixes the statement's seed
+    into those bits: each seed (and each line, whose number is part of the statement seed) draws other noise."""
+    key = L(2) + txl.O
+    draws = {}
+    for seed in (0, 1, 1009, 1_000_003, 1_000_003 + 1009):        # statement seed = seed * 1_000_003 + line * 1009
+        generator = torch.Generator().manual_seed(resolve.tensor_seed(seed, key))
+        draws[seed] = torch.randn(8, generator=generator, dtype=torch.float64)
+    assert len({tuple(d.tolist()) for d in draws.values()}) == len(draws)
+    other = torch.randn(8, generator=torch.Generator().manual_seed(resolve.tensor_seed(0, L(1) + txl.O)),
+                        dtype=torch.float64)
+    assert not torch.equal(other, draws[0])
+
+    script = 'model txl-tiny\nseed {}\nedit delete(L2)\nedit swap(L1, L2)\n\n\nedit delete(L2)'
+    controls = {seed: [row['metrics']['control']['dloss'] for row in run_script(script.format(seed))]
+                for seed in (0, 1, 77)}
+    assert controls[0] == [row['metrics']['control']['dloss'] for row in run_script(script.format(0))]   # repeatable
+    for seed, (first, _, again) in controls.items():
+        assert first != again, seed                       # the same edit on another line: another control direction
+    for line in range(3):
+        assert len({values[line] for values in controls.values()}) == 3, line     # another seed: another control
+
+
+def test_the_control_turns_its_noise_into_the_control_tensors_in_place(monkeypatch):
+    """The control holds one extra copy of the changed tensors: each noise buffer becomes its control tensor."""
+    model = load_model('txl-tiny')
+    W0, seed = model.W0, 99
+    after = txl.zero_writers(W0, [1, 2])
+    metrics = {'dloss': 0.1, **resolve._changes(W0, after)}
+    drawn, seen = [], []
+    real_randn, real_forward = torch.randn, txl.forward
+    monkeypatch.setattr(torch, 'randn', lambda *a, **k: drawn.append(real_randn(*a, **k)) or drawn[-1])
+    monkeypatch.setattr(txl, 'forward', lambda cfg, W, ids, *a, **k: seen.append(W) or real_forward(cfg, W, ids, *a, **k))
+    resolve._txl_control(model, after, 'ln', seed, metrics)
+    base = seen.pop()
+    moved = {k: base[k] for k in base if base[k] is not W0[k]}
+    assert len(moved) == len(drawn) == 2 * len(txl.WRITERS)
+    assert {id(t) for t in moved.values()} == {id(t) for t in drawn}       # no second copy of the changed tensors
+    noise = {}                                                              # bit for bit before + factor * noise
+    for entry in metrics['changed_tensors']:
+        name = entry['name']
+        generator = torch.Generator().manual_seed(resolve.tensor_seed(seed, name))
+        noise[name] = real_randn(W0[name].shape, generator=generator, dtype=torch.float64) * (after[name] != W0[name])
+    factor = metrics['param_dist'] / math.sqrt(sum(torch.linalg.vector_norm(eps).item() ** 2 for eps in noise.values()))
+    assert all(torch.equal(moved[name], W0[name] + eps * factor) for name, eps in noise.items())
+
+
+def test_align_toward_another_layer_is_exact_and_align_of_another_layer_is_an_edit():
+    """What the Editor palette says about txl L[i] := E: align(L[i] -> L[j]) only permutes L[i]; align(L[j] -> L[i])
+    puts a permuted L[j] in slot i and measures like L[i] := L[j]."""
+    from wsbench.server._catalog import OPS
+
+    doc = next(op['doc'] for op in OPS if op['family'] == 'txl' and op['call'] == 'L[i] := E')
+    assert 'L[i] := align(L[i] -> L[j]) is exact' in doc and 'align(L[j] -> L[i])' in doc and 'edit' in doc
+    rows = run_script('model txl-tiny\ngauge L1 := align(L1 -> L2)\ngauge L1 := align(L2 -> L1)\ngauge L1 := L2\n'
+                      'gauge L1 := lerp(L1, align(L1 -> L2), 0.5)')
+    assert [row['status'] for row in rows] == ['CONFIRMED', 'REFUTED', 'REFUTED', 'REFUTED']
+    assert rows[1]['metrics']['dloss'] == pytest.approx(rows[2]['metrics']['dloss'], abs=1e-12)
+    assert rows[1]['metrics']['rel'] == pytest.approx(rows[2]['metrics']['rel'], rel=1e-9)
 
 
 def test_thread_policy(monkeypatch):

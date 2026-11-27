@@ -1,10 +1,13 @@
 """Offline HTTP acceptance tests, including the asynchronous run lifecycle."""
+import re
+import shutil
+import subprocess
 from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
 from uuid import UUID
 
-from json import loads as json_loads
+from json import dumps as json_dumps, loads as json_loads
 
 import numpy as np
 import pytest
@@ -1077,3 +1080,34 @@ def test_sending_events_retries_overload_and_stored_ids_follow_the_key(client, t
     assert not (tmp_path / "agent.json").exists()
     monkeypatch.setenv("WSB_ANTHROPIC_WORKSPACE", "wrkspc_01")
     assert module.console_url("sesn_9") == "https://platform.claude.com/workspaces/wrkspc_01/sessions/sesn_9"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="runs two functions of app.js in node")
+def test_tensor_panel_inserts_a_valid_gridop_for_every_matrix():
+    """'Insert gridop(...)' in the tensor panel: the default block is square, so the rot90 it writes validates for every
+    2-D parameter of every weight model (some Transformer-XL matrices have a side below 16); a non-square block gets
+    rot180, which fits any block."""
+    from wsbench.lang.parser import parse
+    from wsbench.lang.validate import validate
+    from wsbench.models.registry import SHAPES, WEIGHT_MODELS, param_shapes
+
+    source = (Path(__file__).parents[1] / "wsbench" / "server" / "static" / "app.js").read_text(encoding="utf-8")
+    functions = [re.search(rf"^function {name}\(.*?^}}$", source, re.M | re.S)
+                 for name in ("defaultBlock", "gridopStatement")]
+    matrices = {model: {name: shape for name, shape in param_shapes(SHAPES[model]).items() if len(shape) == 2}
+                for model in WEIGHT_MODELS}
+    program = "\n".join(match.group(0) for match in functions) + f"""
+const matrices = {json_dumps(matrices)};
+const out = {{nonsquare: gridopStatement('crit.cluster_weight', [0, 3, 0, 16])}};
+for (const [model, tensors] of Object.entries(matrices))
+  out[model] = Object.entries(tensors).map(([name, shape]) => gridopStatement(name, defaultBlock(shape)));
+process.stdout.write(JSON.stringify(out));
+"""
+    out = json_loads(subprocess.run(["node", "-e", program], capture_output=True, text=True, check=True).stdout)
+    assert out.pop("nonsquare") == 'edit gridop(rot180, block("crit.cluster_weight", 0, 3, 0, 16))'
+    assert 'edit gridop(rot90, block("crit.cluster_weight", 0, 3, 0, 3))' in out["txl-tiny"]
+    assert 'edit gridop(rot90, block("gpt_neox.embed_in.weight", 0, 16, 0, 16))' in out["pythia-14m"]
+    for model, statements in out.items():
+        assert len(statements) == len(matrices[model])
+        parsed, errors = parse(f"model {model}\n" + "\n".join(statements))
+        assert errors == validate(parsed) == [], model

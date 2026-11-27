@@ -34,9 +34,12 @@ OPS ON Transformer-XL (txl-tiny, transfo-xl-wt103: post-LayerNorm, ReLU MLP, rel
   permute(L[i].heads, randperm|perm([...]))   vo(L[i].H[h], gl|orth)   qk(L[i].H[h], gl|orth)  (all dims; no dims=pass)
   delete(L[i])   swap(L[i], L[j])   L[i] := L[j] | lerp(X, Y, t) | neg_writers(X) | neg(X) | align(X -> Y)   gridop(...)
   delete zeroes o_net, CoreNet.3 and its bias; the post-LayerNorms stay, so the layer becomes x -> LN2(LN1(x)).
-  neg negates all but the LayerNorms: the attention output is unchanged, the MLP is not. Tensors for block():
-  transformer.layers.{i}.dec_attn.{qkv_net,o_net,r_net}.weight, transformer.layers.{i}.pos_ff.CoreNet.{0,3}.weight,
-  transformer.word_emb.emb_layers.{c}.weight (also the softmax weight of cluster c).
+  neg negates all but the LayerNorms: the attention output is unchanged, the MLP is not. Tensors for block() (every
+  2-D parameter): transformer.layers.{i}.dec_attn.{qkv_net,o_net,r_net}.weight and .{r_w_bias,r_r_bias} [heads, dh];
+  transformer.layers.{i}.pos_ff.CoreNet.{0,3}.weight; transformer.word_emb.emb_layers.{c}.weight (also the softmax
+  weight of cluster c); transformer.word_emb.emb_projs.{c} (for c >= 1 also the softmax projection of cluster c);
+  crit.out_projs.0 (the softmax projection of cluster 0, not tied); crit.cluster_weight. The names of the tied
+  copies, crit.out_layers.{c}.weight and crit.out_projs.{c} for c >= 1, give E_TARGET.
   Not defined (E_MODEL): fold_ln, center_writers, ln_to_rms, rotate(resid, ...), scale(resid, ...), rope_pairs.
 
 OPS ON modadd
@@ -60,11 +63,11 @@ FACTS MEASURED ON THESE MODELS (float64; exact = relative logit change about 1e-
   pythia-14m edits (delta-loss in nats, base 4.3177): delete middle layer +4.04; swap layers 2,3 +3.27;
           L4 := -L2 (writers negated) +2.51 (delete L4 alone +2.16, delete L2 and L4 +4.06); L3 := mean(L2, L4) +4.99.
   Transformer-XL exact: MLP neuron permutation and positive per-neuron rescaling (ReLU); head permutation; V/O and
-          Q/K change of basis per head; aligning a layer to another. Not exact: rotating MLP neurons; neg(L).
+          Q/K change of basis per head; L[i] := align(L[i] -> L[j]). Not exact: rotating MLP neurons; neg(L).
   transfo-xl-wt103 (122 WikiText-103 tokens, base loss 4.7249; L[mid] = L9 of 18): exact symmetries change the
-          log-probabilities by 1e-15 to 1e-13 relative. Edits: delete L9 -0.05; swap L8,L9 +3.53; L10 := -L8 (writers
-          negated) +4.58 (delete L10 alone -0.01, delete L8 and L10 +0.70); L9 := mean(L8, L10) +0.94; rotate the
-          L9 MLP +4.73.
+          log-probabilities by at most 1.4e-13 relative (largest in L0 and L1, about 1e-15 in L9). Edits: delete L9
+          -0.05; swap L8,L9 +3.53; L10 := -L8 (writers negated) +4.58 (delete L10 alone -0.01, delete L8 and L10
+          +0.70); L9 := mean(L8, L10) +0.94; rotate the L9 MLP +4.73.
   modadd (p=97, 50 % train): memorised by step ~150, generalises (test >= 0.9) by step ~1200; Grokfast ~1.2x earlier;
           the straight line memorised -> grokked has a barrier (train acc ~0.8 at t=0.25); the direction of one seed
           is orthogonal to another seed's (cosine ~0) and transplanting it destroys the other model."""

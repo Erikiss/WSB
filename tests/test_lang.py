@@ -294,3 +294,38 @@ s, e = parse('model transfo-xl-wt103\\ngauge rotate(L[mid].mlp, orth)\\ngauge fo
 assert not e and [x['code'] for x in validate(s)] == ['E_MODEL'] and [h['code'] for h in hints(s)] == ['H_RELU_ROTATE']
 assert 'torch' not in sys.modules
 """], check=True)
+
+
+def test_the_card_names_every_txl_matrix_for_block():
+    """Assist, Explore and the agent see only the card, so its block() list for Transformer-XL must name every 2-D
+    parameter (and the tied names that are not parameters)."""
+    import re
+
+    from wsbench.lang.card import LANGUAGE_CARD
+    from wsbench.models.registry import SHAPES, param_shapes, txl_tied
+
+    section = LANGUAGE_CARD.split("Tensors for block()")[1].split("Not defined (E_MODEL)")[0]
+    written = {    # each family of matrix names -> how the card writes it
+        r"transformer\.layers\.\d+\.dec_attn\.(qkv_net|o_net|r_net)\.weight":
+            "transformer.layers.{i}.dec_attn.{qkv_net,o_net,r_net}.weight",
+        r"transformer\.layers\.\d+\.dec_attn\.r_[wr]_bias": ".{r_w_bias,r_r_bias}",
+        r"transformer\.layers\.\d+\.pos_ff\.CoreNet\.[03]\.weight": "transformer.layers.{i}.pos_ff.CoreNet.{0,3}.weight",
+        r"transformer\.word_emb\.emb_layers\.\d+\.weight": "transformer.word_emb.emb_layers.{c}.weight",
+        r"transformer\.word_emb\.emb_projs\.\d+": "transformer.word_emb.emb_projs.{c}",
+        r"crit\.out_projs\.0": "crit.out_projs.0",
+        r"crit\.cluster_weight": "crit.cluster_weight",
+    }
+    for model in ("txl-tiny", "transfo-xl-wt103"):
+        assert SHAPES[model]["tie_projs"] == (False, True, True, True)     # what the card says about the tying
+        for name, shape in param_shapes(SHAPES[model]).items():
+            assert (len(shape) == 2) == any(re.fullmatch(p, name) for p in written), name
+        assert {re.sub(r"\.\d+\.", ".{c}.", n) for n in txl_tied(SHAPES[model]) if "out_layers" in n} == {
+            "crit.out_layers.{c}.weight"}
+    for text in [*written.values(), "crit.out_layers.{c}.weight", "crit.out_projs.{c} for c >= 1", "E_TARGET"]:
+        assert text in section, text
+    statements, errors = parse('model txl-tiny\nedit '
+                               'gridop(rot180, block("transformer.layers.1.dec_attn.r_w_bias", 0, 2, 0, 8)); '
+                               'gridop(hmirror, block("transformer.word_emb.emb_projs.1", 0, 16, 0, 8)); '
+                               'gridop(rot90, block("crit.out_projs.0", 0, 16, 0, 16)); '
+                               'gridop(hmirror, block("crit.cluster_weight", 0, 3, 0, 16))')
+    assert errors == validate(statements) == []

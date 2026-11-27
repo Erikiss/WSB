@@ -128,6 +128,10 @@ class Model:
 
 
 _load_lock = RLock()
+# Every weight model has a cache slot, so no model evicts another: a reload of transfo-xl-wt103 re-hashes 1.1 GB and
+# rebuilds its 2.4 GiB baseline. The two tiny models take kilobytes, so the most this holds is what two slots could
+# already hold: pythia-14m and transfo-xl-wt103.
+WEIGHT_MODELS = tuple(name for name, S in SHAPES.items() if S['family'] in ('neox', 'txl'))
 
 
 def load_model(name: str) -> Model:
@@ -138,28 +142,13 @@ def load_model(name: str) -> Model:
         return _load_model(name, directory)
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=len(WEIGHT_MODELS))
 def _load_model(name: str, directory: Path | None) -> Model:
-    import torch
-    from . import neox
-
-    module = neox
-    if name == 'neox-tiny':
-        W0 = neox.make_tiny(seed=0)
-        cfg = neox.TINY_CFG
-        ids = torch.tensor([neox.TINY_IDS])
-    elif name == 'pythia-14m':
-        from safetensors.torch import load_file
-        from tokenizers import Tokenizer
-        from .fetch import verify_pythia
-
-        verify_pythia(directory)
-        cfg = neox.cfg_from_hf_config(json.loads((directory / 'config.json').read_text()))
-        W0 = {key: tensor.to(torch.float64) for key, tensor in load_file(directory / 'model.safetensors').items()}
-        tokens = Tokenizer.from_file(str(directory / 'tokenizer.json')).encode(PROBE_TEXT).ids
-        assert len(tokens) == 149, 'unexpected Pythia probe token count'
-        ids = torch.tensor([tokens])
-    elif SHAPES.get(name, {}).get('family') == 'txl':
+    family = SHAPES.get(name, {}).get('family')
+    if family == 'neox':
+        from . import neox as module
+        W0, cfg, ids = _load_neox(name, directory)
+    elif family == 'txl':
         from . import txl as module
         W0, cfg, ids = _load_txl(name, directory)
     else:
@@ -170,6 +159,26 @@ def _load_model(name: str, directory: Path | None) -> Model:
     assert {key: tuple(t.shape) for key, t in W0.items()} == param_shapes(expected)
     logits = module.forward(cfg, W0, ids)
     return Model(W0, cfg, ids, logits, module.next_token_loss(logits, ids), logits.abs().max().item())
+
+
+def _load_neox(name, directory):
+    import torch
+    from . import neox
+
+    if name == 'neox-tiny':
+        return neox.make_tiny(seed=0), neox.TINY_CFG, torch.tensor([neox.TINY_IDS])
+    if name != 'pythia-14m':
+        raise ValueError(f'unknown NeoX model {name!r}')
+    from safetensors.torch import load_file
+    from tokenizers import Tokenizer
+    from .fetch import verify_pythia
+
+    verify_pythia(directory)
+    cfg = neox.cfg_from_hf_config(json.loads((directory / 'config.json').read_text()))
+    W0 = {key: tensor.to(torch.float64) for key, tensor in load_file(directory / 'model.safetensors').items()}
+    tokens = Tokenizer.from_file(str(directory / 'tokenizer.json')).encode(PROBE_TEXT).ids
+    assert len(tokens) == 149, 'unexpected Pythia probe token count'
+    return W0, cfg, torch.tensor([tokens])
 
 
 def _load_txl(name, directory):
