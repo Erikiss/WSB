@@ -30,8 +30,9 @@ def main(argv=None):
     run.add_argument("--json", type=Path, metavar="OUT.json")
     check = commands.add_parser("check", help="check WSL syntax, types and hints")
     check.add_argument("file", type=Path)
-    fetch = commands.add_parser("fetch", help="download the pinned model or ARC corpus")
-    fetch.add_argument("what", choices=["pythia-14m", "arc", "all"])
+    fetch = commands.add_parser("fetch", help="download a pinned model or the ARC corpus "
+                                "(all = pythia-14m and arc; the 1.1 GB transfo-xl-wt103 only by name)")
+    fetch.add_argument("what", choices=["pythia-14m", "transfo-xl-wt103", "arc", "all"])
     args = parser.parse_args(argv)
     if args.command == "serve":
         import uvicorn
@@ -42,6 +43,9 @@ def main(argv=None):
             if args.what in ("all", "pythia-14m"):
                 from .models.fetch import fetch_pythia
                 fetch_pythia()
+            if args.what == "transfo-xl-wt103":
+                from .models.fetch import fetch as fetch_model
+                fetch_model(args.what)
             if args.what in ("all", "arc"):
                 from .arc.data import fetch_arc
                 fetch_arc()

@@ -78,6 +78,16 @@ Set `WSB_LLM=mock` for the offline assist demonstration. A live session reads `O
 - With `WSB_LLM=mock` a scripted stand-in platform answers, for offline use.
 - Not verified live: no Anthropic key was available in the development environment. Tested with stand-in platforms only (event handling, tool execution, budget, errors, storage) and in Chromium in mock mode.
 
+## Transformer-XL
+
+- Two weight models of the family `txl` (`wsbench/models/txl.py`): `transfo-xl-wt103`, the Hugging Face checkpoint `transfo-xl/transfo-xl-wt103` at revision `40a186da79458c9f9de846edfaea79c412137f97` (Transformer-XL large on WikiText-103: 18 layers, d 1024, 16 heads, adaptive embedding and softmax with four clusters), and `txl-tiny` (random weights, offline). `wsbench fetch transfo-xl-wt103` downloads `config.json`, `pytorch_model.bin` (1.1 GB) and `vocab.json`; `fetch all` leaves it out. The pickled vocabulary files of the repository are never fetched, and the weights are read with `torch.load(weights_only=True)` after the SHA-256 check.
+- The checkpoint has 285,205,322 parameters (322,473,146 if the tied embedding and softmax tensors are counted twice). No public Transformer-XL checkpoint has 551M parameters. The geometry is read from `config.json`, so another Transformer-XL checkpoint needs a snapshot entry in `fetch.py` and a `SHAPES` entry, no new code (configurations with `div_val` 1, pre-LayerNorm or shared position biases are refused).
+- A model state holds each tensor once: the softmax weights and the tied projections are stored under their `transformer.word_emb.*` names. Operators are copy-on-write: they share every tensor they leave alone.
+- WSBench measures one segment without memory (the plain causal mask, as on the first segment of the original evaluation). Hugging Face's TransfoXL called without `mems` prepends 1600 all-zero memory slots to every layer instead. They act as an attention sink and lower the probe loss from 4.7249 to 4.1357 nats. `txl.forward(..., zero_mems=1600)` reproduces that call.
+- The positional frequencies are the checkpoint's float32 table (`transformer.pos_emb.inv_freq`, at most 8.2e-8 relative from the float64 formula). The formula in float64 would move the probe log-probabilities by up to 6.4e-6.
+- Agreement with transformers 4.46.3 in float64: `txl-tiny` within 1.1e-14 in every log-probability (without memory, with zero memories, a batch of two, `same_length` off, other clamp and window lengths). On the 122-token WikiText-103 probe the largest log-probability difference is 3.9e-12; the loss is 4.724939573022554 against 4.724939573022569, and 4.135668769365871 against 4.135668769365872 with zero memories. The references are in `tests/data/txl_tiny_reference.json` and `tests/data/txl_wt103_probe.json`.
+- On four CPU threads `transfo-xl-wt103` loads in 4.0 s (hash checks 1.3 s) and one forward pass takes 0.9 to 1.2 s. The float64 state needs 2.12 GiB; the process peaks at 3.0 GiB after loading. An exact symmetry measured at full size changes the log-probabilities by at most 9.1e-14 relative.
+
 ## Acceptance measurements
 
 - The pinned Pythia download matched all three SHA-256 values. The 76-tensor model yielded 149 probe tokens, loss 4.3176623 and maximum absolute logit 25.84748.
