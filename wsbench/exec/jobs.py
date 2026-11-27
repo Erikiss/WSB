@@ -16,6 +16,7 @@ from .executor import run_script
 from .verdict import agreement, failed, prepare
 
 KEEP = 50
+STATE_BYTES = 2 << 30       # tensor views keep the changed tensors of recent runs, at most this many bytes in all
 SAVE_EVERY_S = 2.0
 RUN_ID = re.compile(r"[0-9a-f]{32}")
 INTERRUPTED = "interrupted: the server restarted before this statement finished"
@@ -23,6 +24,11 @@ INTERRUPTED = "interrupted: the server restarted before this statement finished"
 
 def _history():
     return home() / "history"
+
+
+def _nbytes(changed):
+    """Bytes of the distinct tensors of a line's state (one tensor can be stored under two names, e.g. L[i] := L[j])."""
+    return sum(t.numel() * t.element_size() for t in {id(t): t for t in changed.values()}.values())
 
 
 class JobError(Exception):
@@ -41,6 +47,8 @@ class Job:
     status: str = "queued"
     stop: Event = field(default_factory=Event)
     states: dict | None = field(default_factory=dict)
+    sizes: dict = field(default_factory=dict)       # line -> bytes of its kept state
+    expired: set = field(default_factory=set)       # lines whose state was dropped to stay within STATE_BYTES
     source: str = "editor"
     created: float = field(default_factory=time.time)
     saved: float = 0.0
@@ -216,6 +224,8 @@ class Jobs:
                             weights, norm_kind = pending[line]
                             changed = {t["name"]: weights[t["name"]] for t in row["metrics"]["changed_tensors"]}
                             job.states[line] = row["model"], changed, norm_kind
+                            job.sizes[line] = _nbytes(changed)
+                            self._limit_states(job)
                 pending.clear()
                 job.verdicts = snapshot
                 due = time.monotonic() - job.saved >= SAVE_EVERY_S
@@ -225,13 +235,29 @@ class Jobs:
         run_script(job.script, on_update=on_update, should_stop=job.stop.is_set,
                    on_state=on_state, predictions=job.predictions)
 
+    def _limit_states(self, job):
+        """Keep the tensor states of all runs within STATE_BYTES (call with the lock held). The states of the oldest
+        runs go first, then the earliest lines of `job`; the newest line always stays. A dropped state answers 410."""
+        total = sum(sum(other.sizes.values()) for other in self._jobs.values() if other.states)
+        for other in self._jobs.values():
+            if total <= STATE_BYTES:
+                return
+            if other is not job and other.states:
+                total -= sum(other.sizes.values())
+                other.states, other.sizes = None, {}
+        while total > STATE_BYTES and len(job.states) > 1:
+            line = next(iter(job.states))
+            del job.states[line]
+            total -= job.sizes.pop(line)
+            job.expired.add(line)
+
     def tensors(self, run_id, line, name):
         with self._lock:
             job = self._jobs.get(run_id)
             if job is None and self._load(run_id) is None:
                 raise JobError(404, "E_NOT_FOUND", "unknown run")
             states = None if job is None else job.states
-            if states is None:
+            if states is None or line in job.expired:
                 raise JobError(410, "E_EXPIRED", "state expired; re-run the script")
             if line not in states:
                 raise JobError(404, "E_NOT_FOUND", "no tensor state for this line")

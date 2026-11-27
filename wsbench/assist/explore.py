@@ -22,8 +22,8 @@ def parameters(request):
     text, model = request.get("text"), request.get("model")
     if not isinstance(text, str) or not text.strip() or not isinstance(model, str):
         raise AssistRequestError("text and model must be non-empty strings")
-    if SHAPES.get(model, {}).get("family") not in {"neox", "grid"}:
-        raise AssistRequestError("model must be a NeoX model or grid:task001 through grid:task400")
+    if SHAPES.get(model, {}).get("family") not in {"neox", "txl", "grid"}:
+        raise AssistRequestError("model must be a NeoX or Transformer-XL model or grid:task001 through grid:task400")
     rounds = request.get("rounds", 3)
     if type(rounds) is not int or not 1 <= rounds <= MAX_ROUNDS:
         raise AssistRequestError(f"rounds must be an integer from 1 to {MAX_ROUNDS}")

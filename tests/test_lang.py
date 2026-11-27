@@ -10,7 +10,8 @@ from wsbench.lang.validate import validate
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = sorted((ROOT / "wsbench/examples").glob("*.wsl")) + [ROOT / "tests/data/tiny_battery.wsl"]
+SCRIPTS = sorted((ROOT / "wsbench/examples").glob("*.wsl")) + [ROOT / "tests/data/tiny_battery.wsl",
+                                                             ROOT / "tests/data/txl_battery.wsl"]
 
 
 def problems(source):
@@ -167,3 +168,164 @@ def test_unrepresentable_float_has_a_json_safe_diagnostic():
     st, errors = parse("model neox-tiny\n" + src)
     assert not st
     assert [(e["code"], e["col"]) for e in errors] == [("E_BAD_ARG", src.index("-") + 1)]
+
+
+# ---------------------------------------------------------------- Transformer-XL
+
+def test_txl_models_parse_with_their_family_and_geometry():
+    from wsbench.lang.parser import valid_model
+    assert valid_model("txl-tiny") and valid_model("transfo-xl-wt103") and not valid_model("transfo-xl")
+    script = """model transfo-xl-wt103
+a: edit delete(L[mid]); swap(L[mid-1], L[mid+1])
+model txl-tiny
+b: gauge qk(L[mid].H[1], gl)
+model modadd
+c: path cosine(ckpt(A, 0), ckpt(A, 1))
+model grid:task001
+d: solve golf()
+model pythia-14m
+e: gauge fold_ln()
+"""
+    statements, errors = parse(script)
+    assert errors == validate(statements) == []
+    assert [s.family for s in statements] == ["txl", "txl", "modadd", "grid", "neox"]
+    wt103, tiny = statements[:2]
+    assert [op.args[0].index for op in wt103.ops] == [9, 8] and wt103.ops[1].args[1].index == 10
+    assert tiny.ops[0].args[0].index == 2
+    assert parse("model transfo-xl\nedit delete(L0)")[1][0]["code"] == "E_MODEL"
+
+
+UNDEFINED_ON_TXL = [
+    ("gauge fold_ln()", "fold_ln", "fold_ln"),
+    ("reparam center_writers()", "center_writers", "center_writers"),
+    ("edit ln_to_rms()", "ln_to_rms", "ln_to_rms"),
+    ("gauge rotate(resid, orth1)", "rotate", "rotate_resid"),
+    ("edit rotate(resid, orth, layers=[1], embed=false, unembed=false)", "rotate", "rotate_resid"),
+    ("approx(0.01) scale(resid, 2)", "scale", "scale_resid"),
+    ("gauge rope_pairs(L1.H0, phis=[0.1, 0.2], scale=2)", "rope_pairs", "rope_pairs"),
+    ("gauge qk(L1.H0, gl, dims=pass)", "dims", "qk_pass"),
+    ("gauge vo(L1.H0, gl); qk(L1.H1, orth, dims=pass)", "dims", "qk_pass"),
+    ("edit delete(L1); fold_ln()", "fold_ln", "fold_ln"),
+    ("edit delete(fold_ln())", "fold_ln", "fold_ln"),
+]
+
+
+@pytest.mark.parametrize(("source", "at", "key"), UNDEFINED_ON_TXL)
+@pytest.mark.parametrize("model", ["txl-tiny", "transfo-xl-wt103"])
+def test_neox_only_operations_are_undefined_on_txl(model, source, at, key):
+    from wsbench.models import txl
+    err, = problems(f"model {model}\n" + source)
+    assert (err["line"], err["code"], err["col"]) == (2, "E_MODEL", source.index(at) + 1)
+    assert err["message"] == txl.UNDEFINED[key]
+    assert parse("model neox-tiny\n" + source)[1] == []
+
+
+@pytest.mark.parametrize(("source", "code", "message"), [
+    ("edit delete(L4)", "E_TARGET", "layer 4 out of range (txl-tiny has L0..L3)"),
+    ("gauge vo(L0.H2, gl)", "E_TARGET", "head 2 out of range"),
+    ("gauge permute(L0.mlp, perm([1, 0]))", "E_BAD_ARG", "expected a permutation of 0..63"),
+    ("gauge qk(L0.H0, gl, dims=rotary)", "E_BAD_ARG", "expected dims in qk"),
+    ("solve prim(rot90)", "E_MODEL", "solve is invalid for txl-tiny"),
+    ("edit golf()", "E_MODEL", "golf belongs to another model family"),
+    ('edit gridop(rot90, block("crit.out_layers.1.weight", 0, 2, 0, 2))', "E_TARGET",
+     "crit.out_layers.1.weight is tied to transformer.word_emb.emb_layers.1.weight: use that name "
+     "(one tensor, used by the embedding and the softmax)"),
+    ('edit gridop(rot90, block("crit.out_projs.3", 0, 2, 0, 2))', "E_TARGET",
+     "crit.out_projs.3 is tied to transformer.word_emb.emb_projs.3: use that name "
+     "(one tensor, used by the embedding and the softmax)"),
+    ('edit gridop(rot90, block("transformer.pos_emb.inv_freq", 0, 2, 0, 2))', "E_TARGET",
+     "unknown or non-matrix parameter transformer.pos_emb.inv_freq"),
+    ('edit gridop(rot90, block("crit.cluster_bias", 0, 2, 0, 2))', "E_TARGET",
+     "unknown or non-matrix parameter crit.cluster_bias"),
+    ('edit gridop(rot90, block("transformer.word_emb.emb_layers.3.weight", 0, 2, 0, 3))', "E_TARGET",
+     "block outside 16 by 2 tensor"),
+    ('edit gridop(rot90, block("crit.out_projs.0", 0, 2, 0, 3))', "E_SHAPE", "rot90 requires a square block"),
+])
+def test_txl_targets_blocks_and_claims(source, code, message):
+    err, = problems("model txl-tiny\n" + source)
+    assert (err["code"], err["message"]) == (code, message)
+
+
+def test_txl_blocks_follow_the_real_geometry():
+    ok = """model transfo-xl-wt103
+edit gridop(hmirror, block("transformer.word_emb.emb_layers.0.weight", 0, 20000, 0, 1024))
+edit gridop(rot90, block("transformer.word_emb.emb_layers.3.weight", 67719, 67735, 0, 16))
+edit gridop(vmirror, block("transformer.layers.17.dec_attn.qkv_net.weight", 0, 3072, 0, 1024))
+edit gridop(dmirror, block("transformer.layers.0.pos_ff.CoreNet.3.weight", 0, 1024, 3072, 4096))
+edit gridop(identity, block("crit.out_projs.0", 0, 1024, 0, 1024)); gridop(rot180, block("crit.cluster_weight", 0, 3, 0, 1024))
+gauge permute(L17.heads, perm([15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0])); vo(L[mid].H[15], gl)
+"""
+    statements, errors = parse(ok)
+    assert errors == validate(statements) == []
+    for source in ('edit gridop(hmirror, block("transformer.word_emb.emb_layers.0.weight", 0, 20001, 0, 1024))',
+                   'edit gridop(rot90, block("transformer.word_emb.emb_layers.1.weight", 0, 300, 0, 300))',
+                   "gauge vo(L17.H16, gl)", "edit delete(L[mid+9])"):
+        assert problems("model transfo-xl-wt103\n" + source)[0]["code"] == "E_TARGET", source
+
+
+def test_txl_statements_print_canonically_and_round_trip():
+    source = """model txl-tiny
+a: gauge permute(L[mid].mlp,randperm); scale(L2.mlp, uniform(.5, 2.)); qk(L0.H[1], orth)
+b: edit L[mid] := lerp(L[mid-1], align(L3 -> L[mid-1]), .25); swap(L0,L1)
+c: edit gridop(rot90, block("transformer.word_emb.emb_layers.0.weight", 0, 4, 0, 4))
+d: approx(0.5) L1 := neg(neg_writers(L2))
+"""
+    statements, errors = parse(source)
+    assert errors == validate(statements) == []
+    printed = [print_statement(s) for s in statements]
+    assert printed == [
+        "a: gauge permute(L[mid].mlp, randperm); scale(L[2].mlp, uniform(0.5, 2.0)); qk(L[0].H[1], orth)",
+        "b: edit L[mid] := lerp(L[mid-1], align(L[3] -> L[mid-1]), 0.25); swap(L[0], L[1])",
+        'c: edit gridop(rot90, block("transformer.word_emb.emb_layers.0.weight", 0, 4, 0, 4))',
+        "d: approx(0.5) L[1] := neg(neg_writers(L[2]))",
+    ]
+    for stmt, text in zip(statements, printed):
+        again, errors = parse("model txl-tiny\n" + text)
+        assert errors == [] and again == [stmt] and again[0].ops[0] == stmt.ops[0]
+
+
+def test_txl_validation_is_torch_free_in_clean_process():
+    subprocess.run([sys.executable, "-c", """
+from wsbench.lang.parser import parse
+from wsbench.lang.validate import validate
+from wsbench.lang.hints import hints
+import sys
+s, e = parse('model transfo-xl-wt103\\ngauge rotate(L[mid].mlp, orth)\\ngauge fold_ln()')
+assert not e and [x['code'] for x in validate(s)] == ['E_MODEL'] and [h['code'] for h in hints(s)] == ['H_RELU_ROTATE']
+assert 'torch' not in sys.modules
+"""], check=True)
+
+
+def test_the_card_names_every_txl_matrix_for_block():
+    """Assist, Explore and the agent see only the card, so its block() list for Transformer-XL must name every 2-D
+    parameter (and the tied names that are not parameters)."""
+    import re
+
+    from wsbench.lang.card import LANGUAGE_CARD
+    from wsbench.models.registry import SHAPES, param_shapes, txl_tied
+
+    section = LANGUAGE_CARD.split("Tensors for block()")[1].split("Not defined (E_MODEL)")[0]
+    written = {    # each family of matrix names -> how the card writes it
+        r"transformer\.layers\.\d+\.dec_attn\.(qkv_net|o_net|r_net)\.weight":
+            "transformer.layers.{i}.dec_attn.{qkv_net,o_net,r_net}.weight",
+        r"transformer\.layers\.\d+\.dec_attn\.r_[wr]_bias": ".{r_w_bias,r_r_bias}",
+        r"transformer\.layers\.\d+\.pos_ff\.CoreNet\.[03]\.weight": "transformer.layers.{i}.pos_ff.CoreNet.{0,3}.weight",
+        r"transformer\.word_emb\.emb_layers\.\d+\.weight": "transformer.word_emb.emb_layers.{c}.weight",
+        r"transformer\.word_emb\.emb_projs\.\d+": "transformer.word_emb.emb_projs.{c}",
+        r"crit\.out_projs\.0": "crit.out_projs.0",
+        r"crit\.cluster_weight": "crit.cluster_weight",
+    }
+    for model in ("txl-tiny", "transfo-xl-wt103"):
+        assert SHAPES[model]["tie_projs"] == (False, True, True, True)     # what the card says about the tying
+        for name, shape in param_shapes(SHAPES[model]).items():
+            assert (len(shape) == 2) == any(re.fullmatch(p, name) for p in written), name
+        assert {re.sub(r"\.\d+\.", ".{c}.", n) for n in txl_tied(SHAPES[model]) if "out_layers" in n} == {
+            "crit.out_layers.{c}.weight"}
+    for text in [*written.values(), "crit.out_layers.{c}.weight", "crit.out_projs.{c} for c >= 1", "E_TARGET"]:
+        assert text in section, text
+    statements, errors = parse('model txl-tiny\nedit '
+                               'gridop(rot180, block("transformer.layers.1.dec_attn.r_w_bias", 0, 2, 0, 8)); '
+                               'gridop(hmirror, block("transformer.word_emb.emb_projs.1", 0, 16, 0, 8)); '
+                               'gridop(rot90, block("crit.out_projs.0", 0, 16, 0, 16)); '
+                               'gridop(hmirror, block("crit.cluster_weight", 0, 3, 0, 16))')
+    assert errors == validate(statements) == []

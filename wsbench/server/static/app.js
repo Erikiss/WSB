@@ -108,6 +108,7 @@ function showHealth(health) {
   $('health').replaceChildren();
   for (const [key, value, available] of [
     ['pythia-14m', health.models_local['pythia-14m'] ? 'yes' : 'no', health.models_local['pythia-14m']],
+    ['transfo-xl-wt103', health.models_local['transfo-xl-wt103'] ? 'yes' : 'no', health.models_local['transfo-xl-wt103']],
     ['ARC data', health.arc_local ? 'yes' : 'no', health.arc_local],
     ['LLM', health.llm, health.llm !== 'no-key'],
     ['Claude direct', health.anthropic ? 'yes' : 'no', health.anthropic]
@@ -120,7 +121,7 @@ function showHealth(health) {
 function drawPalette() {
   const visible = language.ops.filter(op => op.family === family);
   $('families').replaceChildren();
-  for (const name of ['neox','modadd','grid']) {
+  for (const name of ['neox','txl','modadd','grid']) {
     const tab = button(name, () => { family = name; drawPalette(); });
     tab.setAttribute('aria-pressed', String(family === name));
     $('families').append(tab);
@@ -397,6 +398,12 @@ function arcGrid(grid, label) {
 function heatmap(data, scale, label) {
   const h = data.length, w = data[0].length;
   const node = canvas(w, h, label, 'heatmap');
+  if (w >= 8 * h) {
+    // A flat tensor (a 1-D bias, crit.cluster_weight [3 x 1024]) would be a sliver of 1-3 px at the full width under
+    // object-fit: contain. Stretch it instead, at least 8 px per row; square and tall matrices keep contain.
+    node.style.objectFit = 'fill';
+    node.style.minHeight = Math.min(360, Math.max(14, 8 * h)) + 'px';
+  }
   const ctx = node.getContext('2d'), pixels = ctx.createImageData(w,h);
   const blue = [33,102,172], red = [178,24,43];
   let i = 0;
@@ -499,6 +506,17 @@ function showDetail(pane, verdict) {
     detail.append(el('p','legend',verdict.status === 'RUNNING' ? 'Waiting for measurements…' : 'No measurements available.'));
   }
 }
+// The tensor panel's default block is square, at most 16 x 16, so the rot90 that 'Insert gridop(...)' writes is valid
+// for every matrix (some Transformer-XL matrices have a side below 16). A block made non-square gets rot180, which
+// fits any block.
+function defaultBlock(shape) {
+  const side = Math.min(16, shape[0], shape[1]);
+  return [0, side, 0, side];
+}
+function gridopStatement(name, [r0, r1, c0, c1]) {
+  const primitive = r1 - r0 === c1 - c0 ? 'rot90' : 'rot180';
+  return 'edit gridop(' + primitive + ', block(' + JSON.stringify(name) + ', ' + [r0, r1, c0, c1].join(', ') + '))';
+}
 function tensorPanel(pane, verdict, tensor, target) {
   const revision = ++pane.revision;
   let load = 0;
@@ -508,9 +526,9 @@ function tensorPanel(pane, verdict, tensor, target) {
   const controls = el('div','detail-controls');
   const results = el('div','triple'), legend = el('p','legend');
   if (tensor.shape.length === 2) {
+    const [r0, r1, c0, c1] = defaultBlock(tensor.shape);
     for (const [label,defaultValue,limit] of [
-      ['r0',0,tensor.shape[0]],['r1',Math.min(16,tensor.shape[0]),tensor.shape[0]],
-      ['c0',0,tensor.shape[1]],['c1',Math.min(16,tensor.shape[1]),tensor.shape[1]]
+      ['r0',r0,tensor.shape[0]],['r1',r1,tensor.shape[0]],['c0',c0,tensor.shape[1]],['c1',c1,tensor.shape[1]]
     ]) {
       const input = el('input');
       input.type = 'number'; input.min = '0'; input.max = limit; input.step = '1'; input.value = defaultValue;
@@ -524,7 +542,7 @@ function tensorPanel(pane, verdict, tensor, target) {
     controls.append(toggle, button('Insert gridop(...)', () => {
       if (!validBounds()) { legend.textContent = 'Choose valid integer bounds for this tensor.'; return; }
       location.hash = 'editor';
-      insertText('edit gridop(rot90, block(' + JSON.stringify(tensor.name) + ', ' + Object.values(bounds).map(n=>n.valueAsNumber).join(', ') + '))',true);
+      insertText(gridopStatement(tensor.name, Object.values(bounds).map(n=>n.valueAsNumber)),true);
     }));
   }
   function validBounds() {

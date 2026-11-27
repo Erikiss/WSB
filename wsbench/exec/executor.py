@@ -14,9 +14,11 @@ def _check_metrics(metrics):
         raise ArithmeticError("non-finite measurement") from exc
 
 
-def _measure_neox(stmt, verdict, on_state):
-    from .resolve import execute_neox
-    metrics, weights, kind = execute_neox(stmt)
+def _measure_weights(stmt, verdict, on_state):
+    """A NeoX or Transformer-XL statement: the same metrics and verdict rules for both families."""
+    from . import resolve
+    execute = resolve.execute_txl if stmt.family == "txl" else resolve.execute_neox
+    metrics, weights, kind = execute(stmt)
     _check_metrics(metrics)
     rel = metrics["rel"]
     measured = "exact" if rel <= 1e-9 else "near" if rel <= 1e-3 else "edit"
@@ -51,8 +53,8 @@ def run_script(script: str, on_update=None, should_stop=None, on_state=None, pre
         start = perf_counter()
         publish()
         try:
-            if stmt.family == "neox":
-                _measure_neox(stmt, verdict, on_state)
+            if stmt.family in ("neox", "txl"):
+                _measure_weights(stmt, verdict, on_state)
             elif stmt.family == "grid":
                 from wsbench.arc.data import execute_grid
                 metrics = execute_grid(stmt)

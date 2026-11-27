@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 import re
 from typing import Any
 
+from wsbench.models.registry import SHAPES
+
 
 def location(default=1):
     return field(default=default, compare=False, repr=False)
@@ -84,11 +86,8 @@ class Statement:
 
     @property
     def family(self):
-        if self.model is None:
-            return None
-        if self.model.startswith("grid:"):
-            return "grid"
-        return "modadd" if self.model == "modadd" else "neox"
+        """The registry family of the model in force: neox, txl, modadd or grid (None without a model)."""
+        return None if self.model is None else SHAPES.get(self.model, {}).get("family")
 
     @property
     def display_label(self):

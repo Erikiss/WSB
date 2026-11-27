@@ -13,18 +13,22 @@ from wsbench.models.registry import load_model
 EXAMPLES = Path(__file__).parents[1] / 'wsbench' / 'examples'
 
 
-def test_corrupt_model_fails_before_use(tmp_path, monkeypatch):
-    monkeypatch.setenv('WSB_HOME', str(tmp_path))
+def test_corrupt_model_fails_before_use(hub):
+    stand_in = hub('pythia-14m')                  # offline: fetch() talks to the stand-in hub of conftest.py
     directory = fetch.pythia_dir()
     directory.mkdir(parents=True)
-    corrupt = directory / 'config.json'
-    corrupt.write_bytes(b'corrupt')
-    with pytest.raises(fetch.DownloadError, match='SHA-256 mismatch'):
-        fetch.fetch_pythia()
-    assert not corrupt.exists()
-    verdict = run_script('model pythia-14m\ngauge fold_ln()')[0]
-    assert verdict['status'] == 'ERROR'
-    assert verdict['error'] == {'code': 'E_DOWNLOAD', 'message': 'run: wsbench fetch pythia-14m'}
+    for name in fetch.SHA256:
+        (directory / name).write_bytes(b'corrupt')
+    first, second = run_script('model pythia-14m\ngauge fold_ln()\ngauge fold_ln()')
+    assert first['status'] == second['status'] == 'ERROR'
+    assert first['error'] == {'code': 'E_DOWNLOAD',
+                              'message': 'config.json: SHA-256 mismatch; run: wsbench fetch pythia-14m'}
+    assert not (directory / 'config.json').exists()                 # deleted before anything read it
+    assert second['error'] == {'code': 'E_DOWNLOAD', 'message': 'run: wsbench fetch pythia-14m'}
+    fetch.fetch_pythia()               # downloads the deleted file and, after their hash checks, the corrupt ones
+    assert stand_in.requests == list(fetch.SHA256)
+    assert all((directory / name).read_bytes() == data for name, data in stand_in.files.items())
+    fetch.verify_pythia(directory)
 
 
 @pytest.mark.network

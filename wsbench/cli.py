@@ -19,6 +19,41 @@ def _line(verdict):
     return row
 
 
+_open_line = None      # the file whose progress line is on the terminal and not ended yet
+
+
+def _stderr(text=""):
+    """Print a line to stderr. When that fails (EIO once the terminal has hung up, under a disowned job), the line is
+    dropped: what the command did must not depend on it."""
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def _end_progress():
+    """End the open progress line, so that the next output starts on a line of its own."""
+    global _open_line
+    if _open_line is not None:
+        _open_line = None
+        _stderr()
+
+
+def _progress(file, received, total):
+    """One progress line per downloaded file of at least 1 MiB, rewritten in place (only on a terminal). The line ends
+    with its file (fetch() reports the end of each file once, with total = received when the size was unknown) or
+    before any later output. An OSError (the terminal hung up) goes to fetch(), which then stops calling this."""
+    global _open_line
+    if (received if total is None else total) < 2**20:
+        return
+    if _open_line != file:
+        _end_progress()
+    text = f"{file}: {received / 2**20:.1f} MiB" + (f" of {total / 2**20:.1f} MiB" if total is not None else "")
+    done = total is not None and received >= total
+    print("\r" + text, end="\n" if done else "", file=sys.stderr, flush=True)
+    _open_line = None if done else file
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="wsbench", description="Execute weight-space experiments.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -30,8 +65,10 @@ def main(argv=None):
     run.add_argument("--json", type=Path, metavar="OUT.json")
     check = commands.add_parser("check", help="check WSL syntax, types and hints")
     check.add_argument("file", type=Path)
-    fetch = commands.add_parser("fetch", help="download the pinned model or ARC corpus")
-    fetch.add_argument("what", choices=["pythia-14m", "arc", "all"])
+    fetch = commands.add_parser("fetch", help="download a pinned model or the ARC corpus "
+                                "(all = pythia-14m and arc; the 1.1 GB transfo-xl-wt103 only by name)")
+    fetch.add_argument("what", choices=["pythia-14m", "transfo-xl-wt103", "arc", "all"],
+                       help="all = pythia-14m and arc; transfo-xl-wt103 (1.1 GB) is fetched only by name")
     args = parser.parse_args(argv)
     if args.command == "serve":
         import uvicorn
@@ -39,16 +76,22 @@ def main(argv=None):
         return 0
     if args.command == "fetch":
         try:
+            from .models.fetch import fetch as fetch_model
+            progress = _progress if sys.stderr.isatty() else None
             if args.what in ("all", "pythia-14m"):
-                from .models.fetch import fetch_pythia
-                fetch_pythia()
+                fetch_model("pythia-14m", progress)
+            if args.what == "transfo-xl-wt103":
+                fetch_model(args.what, progress)
             if args.what in ("all", "arc"):
                 from .arc.data import fetch_arc
                 fetch_arc()
             return 0
         except Exception as exc:
-            print(f"E_DOWNLOAD {exc}", file=sys.stderr)
+            _end_progress()
+            _stderr(f"E_DOWNLOAD {exc}")
             return 1
+        finally:
+            _end_progress()                 # also before the traceback of an interrupt
     try:
         script = args.file.read_text(encoding="utf-8")
         if args.command == "check":

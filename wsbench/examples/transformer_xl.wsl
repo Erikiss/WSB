@@ -1,0 +1,20 @@
+model transfo-xl-wt103
+seed 0
+# Transformer-XL on WikiText-103 (18 layers, post-LayerNorm, ReLU MLP): which weight moves are exact symmetries?
+X1: gauge permute(L[mid].mlp, randperm)
+X2: gauge scale(L[mid].mlp, uniform(0.25, 4))
+X3: gauge permute(L[mid].heads, randperm)
+X4: gauge vo(L[mid].H[0], gl)
+X5: gauge qk(L[mid].H[0], gl)
+X6: gauge L[mid] := align(L[mid] -> L[mid-1])
+X7: gauge rotate(L[mid].mlp, orth)
+X8: gauge L[mid] := neg(L[mid])
+# Edits of the middle layers, each measured against a random change of equal norm
+X9: edit delete(L[mid])
+X10: edit swap(L[mid-1], L[mid])
+X11: edit L[mid+1] := neg_writers(L[mid-1])
+X12: edit delete(L[mid+1])
+X13: edit delete(L[mid-1]); delete(L[mid+1])
+X14: edit L[mid] := lerp(L[mid-1], L[mid+1], 0.5)
+X15: edit rotate(L[mid].mlp, orth)
+X16: edit gridop(rot90, block("transformer.layers.9.dec_attn.o_net.weight", 0, 64, 0, 64))
